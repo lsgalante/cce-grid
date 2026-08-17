@@ -51,15 +51,25 @@ struct Style {
 
 fn style() -> Style {
     use cce_ui::config::{get_color, get_i64};
+    // get_color returns raw sRGB; the render pipeline (like every cce-ui
+    // widget color) expects linear.
+    let linear = |c: [f32; 4]| {
+        let f = cce_ui::color::srgb_to_linear;
+        [f(c[0]), f(c[1]), f(c[2]), c[3]]
+    };
     Style {
         cell_size: get_i64("/style/surface/desktop/grid_cell_size", 512) as f64,
         gap_width: (get_i64("/style/surface/desktop/gap_width", 16).max(0)) as f64,
         cell_inset: get_i64("/style/surface/desktop/cell_fade_inset", 0) as f64,
         corner_radius: get_i64("/style/surface/backplate/corner_radius", 12) as f64,
-        gap_color: get_color("/style/surface/desktop/gap_color")
-            .unwrap_or([0.686, 0.796, 0.867, 1.0]),
-        cell_color: get_color("/style/surface/desktop/cell_color")
-            .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        gap_color: linear(
+            get_color("/style/surface/desktop/gap_color")
+                .unwrap_or([0.686, 0.796, 0.867, 1.0]),
+        ),
+        cell_color: linear(
+            get_color("/style/surface/desktop/cell_color")
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        ),
     }
 }
 
