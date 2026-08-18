@@ -47,6 +47,10 @@ struct Style {
     corner_radius: f64,
     gap_color: [f32; 4],
     cell_color: [f32; 4],
+    /// Grid-line lip width in virtual units; None = follow the DE-wide
+    /// relief material (`layout::bevel_width` clamped to the rail), 0 = no
+    /// lip. Negative config values mean unset.
+    line_relief: Option<f64>,
 }
 
 fn style() -> Style {
@@ -70,6 +74,10 @@ fn style() -> Style {
             get_color("/style/surface/desktop/cell_color")
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
         ),
+        line_relief: match get_i64("/style/surface/desktop/line_relief", -1) {
+            v if v < 0 => None,
+            v => Some(v as f64),
+        },
     }
 }
 
@@ -119,9 +127,14 @@ impl GridApp {
         // read far heavier than any plate edge in the toolkit.) Rings stay
         // inside their own half-rail, so neighbors never overlap; the outer
         // radius offsets by the roll to stay concentric with the cell arc.
-        let roll = (cce_ui::layout::bevel_width() as f64)
-            .min(st.gap_width * 0.25)
+        // style.surface.desktop.line_relief overrides the roll width
+        // outright (0 = no lip) without touching the DE-wide material.
+        let roll = st
+            .line_relief
+            .unwrap_or_else(|| (cce_ui::layout::bevel_width() as f64).min(st.gap_width * 0.25))
+            .max(0.0)
             * s;
+        let lip = roll >= 0.5;
         let ring_radius = radius + roll as f32;
         let ring_depth = (roll as f32).max(1.0);
 
@@ -147,17 +160,19 @@ impl GridApp {
                     height: (len * s) as f32,
                 };
                 pc.rounded_rect(rect, radius, (true, true, true, true), st.cell_color);
-                let ring = Rect {
-                    x: rect.x - roll as f32,
-                    y: rect.y - roll as f32,
-                    width: rect.width + 2.0 * roll as f32,
-                    height: rect.height + 2.0 * roll as f32,
-                };
-                pc.recess(
-                    ring,
-                    (ring_radius, ring_radius, ring_radius, ring_radius),
-                    ring_depth,
-                );
+                if lip {
+                    let ring = Rect {
+                        x: rect.x - roll as f32,
+                        y: rect.y - roll as f32,
+                        width: rect.width + 2.0 * roll as f32,
+                        height: rect.height + 2.0 * roll as f32,
+                    };
+                    pc.recess(
+                        ring,
+                        (ring_radius, ring_radius, ring_radius, ring_radius),
+                        ring_depth,
+                    );
+                }
             }
         }
     }

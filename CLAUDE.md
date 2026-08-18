@@ -21,7 +21,9 @@ half-gap, so the walls occupy exactly the half-rail around each cell
 and neighboring rings abut without double-shading. Cell floors carry NO
 relief (user decision); the rails read as raised grout. The compositor
 fallback draws the same expanded-ring chamfer so the client latch never
-swaps the grid's material. It reads the same `style.surface.desktop.*` /
+swaps the grid's material. `style.surface.desktop.line_relief` overrides
+the lip width in logical px for the grid alone (0 = no lip; unset =
+follow the DE-wide relief material) — both renderers honor it. It reads the same `style.surface.desktop.*` /
 backplate-radius keys as the fallback. Keep it that way — no camera
 state, no timers, no input (the surface is input-transparent
 compositor-side).
