@@ -24,6 +24,8 @@ This directory is its own git repository (gitsite-published, fetch-only
 origin; committing locally is publishing). `cce-grid.service` autostarts it
 with the session (WantedBy=cce-session.target); ccebuild installs both.
 
-Known MVP gaps: colors are passed to PaintCtx as raw sRGB (likely needs
-srgb_to_linear — the client renders brighter than the fallback), and corner
-sweeps are tighter than the compositor's span-widened superellipse.
+Corner radii follow the DE-wide convention: the caller widens the nominal
+radius by `cce_ui::layout::corner_span_factor()` (superellipse span
+compensation) before handing it to the primitives, clamped to a quarter
+sweep — same as the compositor's `widen_corner_radius`. An unwidened radius
+reads nearly square at corner_shape > 2 and misses the window corners.

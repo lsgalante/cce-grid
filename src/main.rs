@@ -100,7 +100,15 @@ impl GridApp {
         let lo = inset;
         let len = st.cell_size - 2.0 * inset;
         let s = p.scale;
-        let radius = (st.corner_radius * s) as f32;
+        // Span-widened like every other corner in the DE (window clips,
+        // fallback cells, cce-ui plates): at corner_shape > 2 a raw-radius
+        // superellipse hugs the corner and reads nearly square, and a tiled
+        // window's widened arc must land exactly on its cell's. Clamped to a
+        // quarter sweep like the compositor's widen_corner_radius.
+        let cell_px = len * s;
+        let radius = ((st.corner_radius * s)
+            * cce_ui::layout::corner_span_factor() as f64)
+            .min(cell_px / 2.0) as f32;
         let depth = radius.max(1.0);
 
         let col0 = (p.x / period).floor() as i64;
