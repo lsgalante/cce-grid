@@ -110,16 +110,20 @@ impl GridApp {
             * cce_ui::layout::corner_span_factor() as f64)
             .min(cell_px / 2.0) as f32;
         // The relief lives on the LINES, never the cells: each cell's recess
-        // rect is expanded by the half-gap, so the walls occupy exactly the
-        // half-rail around the cell — descending from a crest at the rail
-        // centerline down to the cell edge. Neighboring recesses abut at the
-        // centerlines (no overlap, no double-shading), so together the rails
-        // read as continuous raised grout while every cell floor stays flat.
-        // The outer radius is the cell arc offset outward by the same
-        // half-gap, so the wall stays concentric with the cell corner.
-        let half_gap = (st.gap_width / 2.0) * s;
-        let ring_radius = radius + half_gap as f32;
-        let ring_depth = (half_gap as f32).max(1.0);
+        // rect is expanded past the cell edge so the wall sits in the rail
+        // band, rolling down from the rail face to the cell floor. The roll
+        // is the BACKPLATE-EDGE treatment — `layout::bevel_width` clamped to
+        // a fraction of the rail, the widget convention — so the rail reads
+        // as a flat plate face with a narrow lip where it meets each sunken
+        // cell. (A half-gap-wide wall turned the whole rail into a ramp and
+        // read far heavier than any plate edge in the toolkit.) Rings stay
+        // inside their own half-rail, so neighbors never overlap; the outer
+        // radius offsets by the roll to stay concentric with the cell arc.
+        let roll = (cce_ui::layout::bevel_width() as f64)
+            .min(st.gap_width * 0.25)
+            * s;
+        let ring_radius = radius + roll as f32;
+        let ring_depth = (roll as f32).max(1.0);
 
         // One extra ring of cells beyond the patch: a border cell outside the
         // patch still owns the inner half of the boundary rail's shading.
@@ -144,10 +148,10 @@ impl GridApp {
                 };
                 pc.rounded_rect(rect, radius, (true, true, true, true), st.cell_color);
                 let ring = Rect {
-                    x: rect.x - half_gap as f32,
-                    y: rect.y - half_gap as f32,
-                    width: rect.width + 2.0 * half_gap as f32,
-                    height: rect.height + 2.0 * half_gap as f32,
+                    x: rect.x - roll as f32,
+                    y: rect.y - roll as f32,
+                    width: rect.width + 2.0 * roll as f32,
+                    height: rect.height + 2.0 * roll as f32,
                 };
                 pc.recess(
                     ring,
