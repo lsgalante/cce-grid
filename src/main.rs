@@ -9,8 +9,9 @@
 //!
 //! The look comes from the same config keys the compositor's fallback grid
 //! reads (`style.surface.desktop.*`, backplate corner radius): flat
-//! rounded cells on the gap-colored rail surface — deliberately unlit, so
-//! the grid reads as ground under the windows' own relief.
+//! rounded cells, with the relief on the LINES — the gap rails read as
+//! raised grout (per-cell half-gap-expanded `Recess` rings that abut at
+//! the rail centerlines), while every cell floor stays flat.
 
 use wayland_client::QueueHandle;
 
@@ -108,11 +109,24 @@ impl GridApp {
         let radius = ((st.corner_radius * s)
             * cce_ui::layout::corner_span_factor() as f64)
             .min(cell_px / 2.0) as f32;
+        // The relief lives on the LINES, never the cells: each cell's recess
+        // rect is expanded by the half-gap, so the walls occupy exactly the
+        // half-rail around the cell — descending from a crest at the rail
+        // centerline down to the cell edge. Neighboring recesses abut at the
+        // centerlines (no overlap, no double-shading), so together the rails
+        // read as continuous raised grout while every cell floor stays flat.
+        // The outer radius is the cell arc offset outward by the same
+        // half-gap, so the wall stays concentric with the cell corner.
+        let half_gap = (st.gap_width / 2.0) * s;
+        let ring_radius = radius + half_gap as f32;
+        let ring_depth = (half_gap as f32).max(1.0);
 
-        let col0 = (p.x / period).floor() as i64;
-        let col1 = ((p.x + p.w) / period).ceil() as i64;
-        let row0 = (p.y / period).floor() as i64;
-        let row1 = ((p.y + p.h) / period).ceil() as i64;
+        // One extra ring of cells beyond the patch: a border cell outside the
+        // patch still owns the inner half of the boundary rail's shading.
+        let col0 = (p.x / period).floor() as i64 - 1;
+        let col1 = ((p.x + p.w) / period).ceil() as i64 + 1;
+        let row0 = (p.y / period).floor() as i64 - 1;
+        let row1 = ((p.y + p.h) / period).ceil() as i64 + 1;
         let mut cells = 0usize;
         for col in col0..col1 {
             for row in row0..row1 {
@@ -128,10 +142,18 @@ impl GridApp {
                     width: (len * s) as f32,
                     height: (len * s) as f32,
                 };
-                // A flat cell — no relief: the grid is ground, not furniture,
-                // and a lit well under every window fought the windows' own
-                // bevels.
                 pc.rounded_rect(rect, radius, (true, true, true, true), st.cell_color);
+                let ring = Rect {
+                    x: rect.x - half_gap as f32,
+                    y: rect.y - half_gap as f32,
+                    width: rect.width + 2.0 * half_gap as f32,
+                    height: rect.height + 2.0 * half_gap as f32,
+                };
+                pc.recess(
+                    ring,
+                    (ring_radius, ring_radius, ring_radius, ring_radius),
+                    ring_depth,
+                );
             }
         }
     }

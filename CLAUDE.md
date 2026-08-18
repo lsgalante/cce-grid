@@ -14,13 +14,17 @@ its own rect grid as the fallback whenever this client is absent or has not
 latched a patch yet, and its gap-colored backdrop always draws beneath as
 the safety net beyond patch edges.
 
-Rendering is a pure function of (patch, style config): flat rounded cells
-on the gap-colored rail surface — deliberately NO relief, so the grid reads
-as ground under the windows' own bevels (the compositor fallback is flat
-for the same reason: the client latch must not swap the grid's material).
-It reads the same `style.surface.desktop.*` / backplate-radius keys as the
-fallback. Keep it that way — no camera state, no timers, no input (the
-surface is input-transparent compositor-side).
+Rendering is a pure function of (patch, style config): flat rounded cells,
+with the relief on the LINES — per-cell `Recess` rings expanded by the
+half-gap, so the walls occupy exactly the half-rail around each cell
+(crest at the rail centerline, inner edge concentric with the cell arc)
+and neighboring rings abut without double-shading. Cell floors carry NO
+relief (user decision); the rails read as raised grout. The compositor
+fallback draws the same expanded-ring chamfer so the client latch never
+swaps the grid's material. It reads the same `style.surface.desktop.*` /
+backplate-radius keys as the fallback. Keep it that way — no camera
+state, no timers, no input (the surface is input-transparent
+compositor-side).
 
 This directory is its own git repository (gitsite-published, fetch-only
 origin; committing locally is publishing). `cce-grid.service` autostarts it
