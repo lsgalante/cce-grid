@@ -8,10 +8,9 @@
 //! of (patch, style config) — no camera state, no timers.
 //!
 //! The look comes from the same config keys the compositor's fallback grid
-//! reads (`style.surface.desktop.*`, backplate corner radius), but drawn
-//! with cce-ui's own primitives: cells are `Recess` wells carved into the
-//! gap-colored rail surface, under the toolkit's real lighting model —
-//! not the compositor's scenefx approximation of it.
+//! reads (`style.surface.desktop.*`, backplate corner radius): flat
+//! rounded cells on the gap-colored rail surface — deliberately unlit, so
+//! the grid reads as ground under the windows' own relief.
 
 use wayland_client::QueueHandle;
 
@@ -109,7 +108,6 @@ impl GridApp {
         let radius = ((st.corner_radius * s)
             * cce_ui::layout::corner_span_factor() as f64)
             .min(cell_px / 2.0) as f32;
-        let depth = radius.max(1.0);
 
         let col0 = (p.x / period).floor() as i64;
         let col1 = ((p.x + p.w) / period).ceil() as i64;
@@ -130,9 +128,10 @@ impl GridApp {
                     width: (len * s) as f32,
                     height: (len * s) as f32,
                 };
-                // The cell floor, then the well walls carved down to it.
+                // A flat cell — no relief: the grid is ground, not furniture,
+                // and a lit well under every window fought the windows' own
+                // bevels.
                 pc.rounded_rect(rect, radius, (true, true, true, true), st.cell_color);
-                pc.recess(rect, (radius, radius, radius, radius), depth);
             }
         }
     }

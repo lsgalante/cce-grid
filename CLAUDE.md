@@ -14,9 +14,11 @@ its own rect grid as the fallback whenever this client is absent or has not
 latched a patch yet, and its gap-colored backdrop always draws beneath as
 the safety net beyond patch edges.
 
-Rendering is a pure function of (patch, style config): cells are `Recess`
-wells carved into the gap-colored rail surface, reading the same
-`style.surface.desktop.*` / backplate-radius keys as the compositor
+Rendering is a pure function of (patch, style config): flat rounded cells
+on the gap-colored rail surface — deliberately NO relief, so the grid reads
+as ground under the windows' own bevels (the compositor fallback is flat
+for the same reason: the client latch must not swap the grid's material).
+It reads the same `style.surface.desktop.*` / backplate-radius keys as the
 fallback. Keep it that way — no camera state, no timers, no input (the
 surface is input-transparent compositor-side).
 
