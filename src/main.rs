@@ -36,6 +36,25 @@ struct Patch {
 
 struct GridApp {
     patch: Option<Patch>,
+    /// The raw `(relief)` string currently installed process-wide (depth +
+    /// wall profile LUT) — a change detector, so the registry is only
+    /// touched when the config value actually changes.
+    applied_relief: Option<String>,
+    /// The DE-wide `bevel_depth` captured before the first spec override,
+    /// restored if the key later reverts to a plain width or is removed.
+    base_depth: Option<f32>,
+}
+
+/// The `line_relief` key's three states — see [`Style::line_relief`].
+enum LineRelief {
+    /// Key absent: follow the DE-wide relief material.
+    Material,
+    /// Plain integer: lip width in virtual units, 0 = no lip.
+    Width(f64),
+    /// A `(relief)` value: its own width/depth/profile, editable in place
+    /// with `cce-relief --key style.surface.desktop.line_relief`. The raw
+    /// string rides along as the change detector.
+    Spec(String, cce_ui::relief_spec::ReliefSpec),
 }
 
 /// Style knobs, re-read per frame from the shared config (cheap: cce-ui
@@ -47,10 +66,10 @@ struct Style {
     corner_radius: f64,
     gap_color: [f32; 4],
     cell_color: [f32; 4],
-    /// Grid-line lip width in virtual units; None = follow the DE-wide
-    /// relief material (`layout::bevel_width` clamped to the rail), 0 = no
-    /// lip. Negative config values mean unset.
-    line_relief: Option<f64>,
+    /// Grid-line lip material: a plain integer width (0 = no lip), a full
+    /// `(relief)` value, or absent = the DE-wide material. Negative integers
+    /// mean unset.
+    line_relief: LineRelief,
 }
 
 fn style() -> Style {
@@ -74,9 +93,17 @@ fn style() -> Style {
             get_color("/style/surface/desktop/cell_color")
                 .unwrap_or([0.0, 0.0, 0.0, 1.0]),
         ),
-        line_relief: match get_i64("/style/surface/desktop/line_relief", -1) {
-            v if v < 0 => None,
-            v => Some(v as f64),
+        line_relief: match cce_ui::config::get_string("/style/surface/desktop/line_relief") {
+            // A string value is a (relief) spec; an unparseable one reads
+            // as unset rather than as some accidental width.
+            Some(s) => match cce_ui::relief_spec::ReliefSpec::parse(&s) {
+                Some(spec) => LineRelief::Spec(s, spec),
+                None => LineRelief::Material,
+            },
+            None => match get_i64("/style/surface/desktop/line_relief", -1) {
+                v if v < 0 => LineRelief::Material,
+                v => LineRelief::Width(v as f64),
+            },
         },
     }
 }
@@ -86,7 +113,47 @@ fn style() -> Style {
 const MAX_CELLS: usize = 8192;
 
 impl GridApp {
-    fn paint(&self, pc: &mut PaintCtx, size: LogicalSize) {
+    /// Install (or roll back) the process-wide material a `(relief)` value
+    /// carries — depth into the style registry, profile into the wall LUT.
+    /// This app draws nothing but the grid, so process-global IS
+    /// per-feature; a change detector keeps it idempotent per frame.
+    fn sync_relief_material(&mut self, line_relief: &LineRelief) {
+        match line_relief {
+            LineRelief::Spec(raw, spec) => {
+                if self.applied_relief.as_deref() == Some(raw.as_str()) {
+                    return;
+                }
+                if self.base_depth.is_none() {
+                    self.base_depth = Some(cce_ui::layout::bevel_depth());
+                }
+                if let Some(d) = spec.depth {
+                    if let Ok(mut reg) = cce_ui::layout::get_style_registry().write() {
+                        reg.set_float("bevel_depth", d);
+                    }
+                }
+                cce_ui::layout::install_wall_profile_spec(spec.profile.as_deref());
+                self.applied_relief = Some(raw.clone());
+            }
+            _ if self.applied_relief.is_some() => {
+                // The key reverted to a plain width or vanished: back to
+                // the DE-wide material the registry still carries.
+                if let Some(d) = self.base_depth.take() {
+                    if let Ok(mut reg) = cce_ui::layout::get_style_registry().write() {
+                        reg.set_float("bevel_depth", d);
+                    }
+                }
+                let global = cce_ui::layout::get_style_registry()
+                    .read()
+                    .ok()
+                    .and_then(|reg| reg.get_string("bevel_profile_spec"));
+                cce_ui::layout::install_wall_profile_spec(global.as_deref());
+                self.applied_relief = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn paint(&mut self, pc: &mut PaintCtx, size: LogicalSize) {
         let Some(p) = self.patch else { return };
         if p.scale <= 0.0 {
             return;
@@ -127,12 +194,20 @@ impl GridApp {
         // read far heavier than any plate edge in the toolkit.) Rings stay
         // inside their own half-rail, so neighbors never overlap; the outer
         // radius offsets by the roll to stay concentric with the cell arc.
-        // style.surface.desktop.line_relief overrides the roll width
-        // outright (0 = no lip) without touching the DE-wide material.
-        let roll = st
-            .line_relief
-            .unwrap_or_else(|| (cce_ui::layout::bevel_width() as f64).min(st.gap_width * 0.25))
-            .max(0.0)
+        // style.surface.desktop.line_relief overrides the roll: a plain
+        // width (0 = no lip), or a full (relief) value carrying its own
+        // width/depth/profile. Explicit widths clamp to the half-rail (the
+        // rings' geometric budget); the material default keeps the tighter
+        // backplate clamp.
+        self.sync_relief_material(&st.line_relief);
+        let roll = match &st.line_relief {
+            LineRelief::Material => {
+                (cce_ui::layout::bevel_width() as f64).min(st.gap_width * 0.25)
+            }
+            LineRelief::Width(w) => w.min(st.gap_width / 2.0),
+            LineRelief::Spec(_, spec) => (spec.width as f64).min(st.gap_width / 2.0),
+        }
+        .max(0.0)
             * s;
         let lip = roll >= 0.5;
         let ring_radius = radius + roll as f32;
@@ -185,7 +260,7 @@ impl Application for GridApp {
         _qh: &QueueHandle<EngineState<Self>>,
         _sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
-        Self { patch: None }
+        Self { patch: None, applied_relief: None, base_depth: None }
     }
 
     fn settings(&self) -> WindowSettings {

@@ -22,8 +22,14 @@ and neighboring rings abut without double-shading. Cell floors carry NO
 relief (user decision); the rails read as raised grout. The compositor
 fallback draws the same expanded-ring chamfer so the client latch never
 swaps the grid's material. `style.surface.desktop.line_relief` overrides
-the lip width in logical px for the grid alone (0 = no lip; unset =
-follow the DE-wide relief material) — both renderers honor it. It reads the same `style.surface.desktop.*` /
+the lip for the grid alone: a plain integer is the lip width in logical
+px (0 = no lip; unset = follow the DE-wide relief material), and a
+`(relief)` value carries a full custom material — width, depth, and wall
+profile (`cce_ui::relief_spec::ReliefSpec`), installed process-wide by
+this client (it draws nothing else) and edited in place with
+`cce-relief --key style.surface.desktop.line_relief`. The compositor
+fallback honors the integer form and a `(relief)` value's width (its
+scenefx chamfer has no custom profile to install). It reads the same `style.surface.desktop.*` /
 backplate-radius keys as the fallback. Keep it that way — no camera
 state, no timers, no input (the surface is input-transparent
 compositor-side).
