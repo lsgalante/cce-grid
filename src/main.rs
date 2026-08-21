@@ -60,7 +60,8 @@ enum LineRelief {
 /// Style knobs, re-read per frame from the shared config (cheap: cce-ui
 /// caches the parse on mtime), with the same defaults the compositor uses.
 struct Style {
-    cell_size: f64,
+    cell_w: f64,
+    cell_h: f64,
     gap_width: f64,
     cell_inset: f64,
     corner_radius: f64,
@@ -81,7 +82,16 @@ fn style() -> Style {
         [f(c[0]), f(c[1]), f(c[2]), c[3]]
     };
     Style {
-        cell_size: get_i64("/style/surface/desktop/grid_cell_size", 512) as f64,
+        // Per-axis sizes; the legacy square grid_cell_size is the fallback
+        // for both, mirroring the compositor's config resolution.
+        cell_w: {
+            let legacy = get_i64("/style/surface/desktop/grid_cell_size", 512);
+            get_i64("/style/surface/desktop/grid_cell_width", legacy) as f64
+        },
+        cell_h: {
+            let legacy = get_i64("/style/surface/desktop/grid_cell_size", 512);
+            get_i64("/style/surface/desktop/grid_cell_height", legacy) as f64
+        },
         gap_width: (get_i64("/style/surface/desktop/gap_width", 16).max(0)) as f64,
         cell_inset: get_i64("/style/surface/desktop/cell_fade_inset", 0) as f64,
         corner_radius: get_i64("/style/surface/backplate/corner_radius", 12) as f64,
@@ -159,8 +169,9 @@ impl GridApp {
             return;
         }
         let st = style();
-        let period = st.cell_size + st.gap_width;
-        if period < 1.0 {
+        let period_x = st.cell_w + st.gap_width;
+        let period_y = st.cell_h + st.gap_width;
+        if period_x < 1.0 || period_y < 1.0 {
             return;
         }
 
@@ -171,16 +182,17 @@ impl GridApp {
         );
 
         // Visible cell box within its period slot, in virtual units.
-        let inset = st.cell_inset.clamp(0.0, st.cell_size / 2.0 - 1.0);
-        let lo = inset;
-        let len = st.cell_size - 2.0 * inset;
+        let inset_x = st.cell_inset.clamp(0.0, (st.cell_w / 2.0 - 1.0).max(0.0));
+        let inset_y = st.cell_inset.clamp(0.0, (st.cell_h / 2.0 - 1.0).max(0.0));
+        let len_w = st.cell_w - 2.0 * inset_x;
+        let len_h = st.cell_h - 2.0 * inset_y;
         let s = p.scale;
         // Span-widened like every other corner in the DE (window clips,
         // fallback cells, cce-ui plates): at corner_shape > 2 a raw-radius
         // superellipse hugs the corner and reads nearly square, and a tiled
         // window's widened arc must land exactly on its cell's. Clamped to a
         // quarter sweep like the compositor's widen_corner_radius.
-        let cell_px = len * s;
+        let cell_px = len_w.min(len_h) * s;
         let radius = ((st.corner_radius * s)
             * cce_ui::layout::corner_span_factor() as f64)
             .min(cell_px / 2.0) as f32;
@@ -215,10 +227,10 @@ impl GridApp {
 
         // One extra ring of cells beyond the patch: a border cell outside the
         // patch still owns the inner half of the boundary rail's shading.
-        let col0 = (p.x / period).floor() as i64 - 1;
-        let col1 = ((p.x + p.w) / period).ceil() as i64 + 1;
-        let row0 = (p.y / period).floor() as i64 - 1;
-        let row1 = ((p.y + p.h) / period).ceil() as i64 + 1;
+        let col0 = (p.x / period_x).floor() as i64 - 1;
+        let col1 = ((p.x + p.w) / period_x).ceil() as i64 + 1;
+        let row0 = (p.y / period_y).floor() as i64 - 1;
+        let row1 = ((p.y + p.h) / period_y).ceil() as i64 + 1;
         let mut cells = 0usize;
         for col in col0..col1 {
             for row in row0..row1 {
@@ -226,13 +238,13 @@ impl GridApp {
                     return;
                 }
                 cells += 1;
-                let vx = col as f64 * period + lo;
-                let vy = row as f64 * period + lo;
+                let vx = col as f64 * period_x + inset_x;
+                let vy = row as f64 * period_y + inset_y;
                 let rect = Rect {
                     x: ((vx - p.x) * s) as f32,
                     y: ((vy - p.y) * s) as f32,
-                    width: (len * s) as f32,
-                    height: (len * s) as f32,
+                    width: (len_w * s) as f32,
+                    height: (len_h * s) as f32,
                 };
                 pc.rounded_rect(rect, radius, (true, true, true, true), st.cell_color);
                 if lip {
