@@ -94,7 +94,12 @@ fn style() -> Style {
         },
         gap_width: (get_i64("/style/surface/desktop/gap_width", 16).max(0)) as f64,
         cell_inset: get_i64("/style/surface/desktop/cell_fade_inset", 0) as f64,
-        corner_radius: get_i64("/style/surface/backplate/corner_radius", 12) as f64,
+        // Canonical-first (cce-ui RFC Phase 7a): the silhouette radius may be
+        // spelled plate{root} or legacy backplate in the shared config.
+        corner_radius: get_i64(
+            "/style/surface/plate/root/corner_radius",
+            get_i64("/style/surface/backplate/corner_radius", 12),
+        ) as f64,
         gap_color: linear(
             get_color("/style/surface/desktop/gap_color")
                 .unwrap_or([0.686, 0.796, 0.867, 1.0]),
