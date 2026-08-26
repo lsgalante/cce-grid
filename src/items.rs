@@ -315,6 +315,48 @@ pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Show the context menu for one desktop item and return the chosen action
+/// id, if any. Runs on a worker thread: it blocks until the menu closes.
+///
+/// The menu is a `cce-cloud --json` popup, the same mechanism the desktop and
+/// app context menus use, so it looks and behaves like every other menu in the
+/// DE rather than something this client drew for itself. The pointer's screen
+/// position has to be asked for — a client knows where its own surface was
+/// touched, never where that is on the screen.
+pub fn item_menu(name: &str) -> Option<String> {
+    use std::io::Write;
+
+    let loc = std::process::Command::new("ccectl").arg("pointer-location").output().ok()?;
+    let loc = String::from_utf8_lossy(&loc.stdout);
+    let coord = |key: &str| -> Option<i32> {
+        loc.split_whitespace()
+            .find_map(|t| t.strip_prefix(key))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .map(|v| v.round() as i32)
+    };
+    let (x, y) = (coord("x=")?, coord("y=")?);
+
+    // The filename is the title so it is clear WHICH image is about to go.
+    let layout = format!(
+        r#"{{"pages":[{{"title":{},"justify":"left","widgets":[
+            {{"type":"button","text":"Remove from Desktop","id":"remove"}}
+        ]}}]}}"#,
+        serde_json::to_string(name).ok()?
+    );
+
+    let mut child = std::process::Command::new("cce-cloud")
+        .args(["--json", "-x", &x.to_string(), "-y", &y.to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(layout.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    let reply: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    reply.get("button")?.as_str().map(|s| s.to_string())
+}
+
 /// Tell the user a drop failed, and why. A drop that silently does nothing
 /// is indistinguishable from one the desktop never received, so every failure
 /// path goes through here rather than only into the log.

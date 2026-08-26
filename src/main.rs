@@ -33,6 +33,10 @@ enum Message {
         px_w: u32,
         px_h: u32,
     },
+    /// The context menu closed on "remove". Carries the path rather than an
+    /// index: the menu is modal on its own thread, and the list can be
+    /// reordered by a drag (or grown by a drop) while it is open.
+    RemoveItem(std::path::PathBuf),
 }
 
 /// The world region the current buffer must cover, as told by the
@@ -389,6 +393,26 @@ impl Application for GridApp {
                 items::save(&model);
                 *needs_rebuild = true;
             }
+            Message::RemoveItem(path) => {
+                let Some(pos) = self.items.iter().position(|(i, _)| i.path == path) else {
+                    return;
+                };
+                // A drag on the removed item cannot outlive it.
+                if self.dragging.is_some() {
+                    self.dragging = None;
+                }
+                let (item, id) = self.items.remove(pos);
+                if let Some(id) = id {
+                    cce_ui::vk::free_image(id);
+                }
+                let model: Vec<items::DesktopItem> =
+                    self.items.iter().map(|(i, _)| i.clone()).collect();
+                items::save(&model);
+                // The file itself stays where it was saved: this unpins the
+                // image from the desktop, it does not delete the user's file.
+                log::info!("[items] removed {} from the desktop", item.path.display());
+                *needs_rebuild = true;
+            }
         }
     }
 
@@ -566,11 +590,35 @@ impl Application for GridApp {
         pos: LogicalPosition,
         needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
-        if button != MouseButton::Left {
-            return None;
-        }
         let Some(p) = self.patch else { return None };
         if p.scale <= 0.0 {
+            return None;
+        }
+        if button == MouseButton::Right {
+            if state != ElementState::Pressed {
+                return None;
+            }
+            let vx = p.x + pos.x as f64 / p.scale;
+            let vy = p.y + pos.y as f64 / p.scale;
+            let hit = self.items.iter().rposition(|(i, _)| {
+                vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h
+            })?;
+            let path = self.items[hit].0.path.clone();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Image".to_string());
+            // The menu blocks until it is dismissed, so it cannot run on the
+            // loop that has to keep drawing the desktop behind it.
+            let sender = self.sender.clone();
+            std::thread::spawn(move || {
+                if items::item_menu(&name).as_deref() == Some("remove") {
+                    let _ = sender.send(Message::RemoveItem(path));
+                }
+            });
+            return None;
+        }
+        if button != MouseButton::Left {
             return None;
         }
         match state {
