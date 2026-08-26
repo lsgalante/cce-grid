@@ -20,8 +20,20 @@ use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{DisplayList, PaintCtx};
 use cce_ui::widget::{ElementState, KeyEvent, MouseButton, MouseScrollDelta};
 
+mod items;
+
 #[derive(Debug, Clone)]
-enum Message {}
+enum Message {
+    /// A dropped image finished fetching, saving and decoding on its worker
+    /// thread. Carried as pixels rather than an image id because the GPU
+    /// upload has to happen on the main loop.
+    ItemReady {
+        item: items::DesktopItem,
+        pixels: Vec<u8>,
+        px_w: u32,
+        px_h: u32,
+    },
+}
 
 /// The world region the current buffer must cover, as told by the
 /// compositor: virtual origin/size and surface px per virtual unit.
@@ -36,6 +48,11 @@ struct Patch {
 
 struct GridApp {
     patch: Option<Patch>,
+    /// Images pinned to the canvas, paired with their uploaded texture id
+    /// (`None` until the renderer exists — see `renderer_init`).
+    items: Vec<(items::DesktopItem, Option<u32>)>,
+    /// Worker threads post finished drops back through this.
+    sender: calloop::channel::Sender<Message>,
     /// The raw `(relief)` string currently installed process-wide (depth +
     /// wall profile LUT) — a change detector, so the registry is only
     /// touched when the config value actually changes.
@@ -267,6 +284,30 @@ impl GridApp {
                 }
             }
         }
+
+        // Pinned images sit ON the canvas, so they are placed by the same
+        // world->patch mapping as the cells and drawn after them. The whole
+        // grid surface is below every window, so an item never covers an app.
+        for (item, id) in self.items.iter() {
+            let Some(id) = *id else { continue };
+            let rect = Rect {
+                x: ((item.x - p.x) * s) as f32,
+                y: ((item.y - p.y) * s) as f32,
+                width: (item.w * s) as f32,
+                height: (item.h * s) as f32,
+            };
+            // Cull off-patch items: at a far zoom-out the patch can hold
+            // hundreds of squares, and an image that is not on it costs a
+            // draw for nothing.
+            if rect.x + rect.width < 0.0
+                || rect.y + rect.height < 0.0
+                || rect.x > size.width as f32
+                || rect.y > size.height as f32
+            {
+                continue;
+            }
+            pc.image(id, rect, 1.0);
+        }
     }
 }
 
@@ -277,7 +318,13 @@ impl Application for GridApp {
         _qh: &QueueHandle<EngineState<Self>>,
         _sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
-        Self { patch: None, applied_relief: None, base_depth: None }
+        Self {
+            patch: None,
+            items: items::load().into_iter().map(|i| (i, None)).collect(),
+            sender: _sender,
+            applied_relief: None,
+            base_depth: None,
+        }
     }
 
     fn settings(&self) -> WindowSettings {
@@ -300,12 +347,123 @@ impl Application for GridApp {
         self.patch = Some(Patch { x, y, w, h, scale });
     }
 
-    fn update(&mut self, _msg: Self::Message, _needs_rebuild: &mut bool, _exit: &mut bool) {}
+    fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, _exit: &mut bool) {
+        match msg {
+            Message::ItemReady { item, pixels, px_w, px_h } => {
+                let id = cce_ui::vk::upload_rgba(pixels, px_w, px_h);
+                log::info!(
+                    "[items] pinned {} at ({:.0}, {:.0})",
+                    item.path.display(),
+                    item.x,
+                    item.y
+                );
+                self.items.push((item, Some(id)));
+                // Persist only the model — the texture id is per-process.
+                let model: Vec<items::DesktopItem> =
+                    self.items.iter().map(|(i, _)| i.clone()).collect();
+                items::save(&model);
+                *needs_rebuild = true;
+            }
+        }
+    }
 
     fn tick(&mut self, _dt: f32, _needs_rebuild: &mut bool) {}
 
-    // The grid layer is input-transparent compositor-side; nothing ever
-    // reaches these.
+    /// Uploads happen here, not in `new`: a reconnect builds a fresh renderer
+    /// and does not replay earlier uploads, so items restored from the sidecar
+    /// (and any pinned before the reconnect) have to be handed over again.
+    fn renderer_init(&mut self, _renderer: &mut cce_ui::vk::VkRenderer) {
+        for (item, id) in self.items.iter_mut() {
+            let Ok(bytes) = std::fs::read(&item.path) else {
+                log::warn!("[items] {} is gone; not drawing it", item.path.display());
+                *id = None;
+                continue;
+            };
+            match items::decode_rgba(&bytes) {
+                Some((pixels, w, h)) => *id = Some(cce_ui::vk::upload_rgba(pixels, w, h)),
+                None => {
+                    log::warn!("[items] {} did not decode", item.path.display());
+                    *id = None;
+                }
+            }
+        }
+    }
+
+    /// What a browser offers for an image on a page, best first: the raw
+    /// bytes if the source has them, else a link to fetch.
+    fn drop_mimes(&self) -> &'static [&'static str] {
+        &[
+            "image/png",
+            "image/jpeg",
+            "text/uri-list",
+            "text/x-moz-url",
+            "text/plain;charset=utf-8",
+            "text/plain",
+        ]
+    }
+
+    fn handle_drop(
+        &mut self,
+        mime: &str,
+        data: &[u8],
+        pos: LogicalPosition,
+        _needs_rebuild: &mut bool,
+    ) {
+        let Some(patch) = self.patch else { return };
+        if patch.scale <= 0.0 {
+            return;
+        }
+        let Some(payload) = items::parse_payload(mime, data) else { return };
+
+        // The drop point in world coordinates — the inverse of the mapping
+        // `paint` uses to place cells, so the image lands under the cursor
+        // whatever the camera is doing.
+        let vx = patch.x + pos.x as f64 / patch.scale;
+        let vy = patch.y + pos.y as f64 / patch.scale;
+
+        // Sized to fit inside one grid cell, keeping aspect: a phone
+        // screenshot would otherwise land several squares wide.
+        let st = style();
+        let (cell_w, cell_h) = (st.cell_w.max(16.0), st.cell_h.max(16.0));
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let (bytes, name) = match items::fetch(payload) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("[items] fetch failed: {e}");
+                    return;
+                }
+            };
+            let Some((pixels, px_w, px_h)) = items::decode_rgba(&bytes) else {
+                log::warn!("[items] dropped data is not a decodable image");
+                return;
+            };
+            // Save even though it is already decoded: the user asked for the
+            // file on their desktop, not just a picture on the canvas.
+            let path = match items::save_to_desktop(&bytes, &name) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("[items] could not save to the desktop folder: {e}");
+                    return;
+                }
+            };
+            let fit = (cell_w / px_w as f64).min(cell_h / px_h as f64).min(1.0);
+            let w = px_w as f64 * fit;
+            let h = px_h as f64 * fit;
+            let item = items::DesktopItem {
+                path,
+                // Centred on the drop point.
+                x: vx - w / 2.0,
+                y: vy - h / 2.0,
+                w,
+                h,
+            };
+            let _ = sender.send(Message::ItemReady { item, pixels, px_w, px_h });
+        });
+    }
+
+    // The grid layer is input-transparent compositor-side; nothing but a drag
+    // ever reaches these.
     fn handle_pointer_move(&mut self, _pos: LogicalPosition, _needs_rebuild: &mut bool) {}
 
     fn handle_mouse_input(
