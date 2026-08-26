@@ -69,6 +69,26 @@ struct GridApp {
     base_depth: Option<f32>,
 }
 
+impl Patch {
+    /// Surface-local logical px per virtual unit.
+    ///
+    /// `Patch::scale` is BUFFER px per virtual unit — it already folds in the
+    /// output scale, which is why the paint path uses it directly. Pointer
+    /// events and input regions are not in that space: both are surface-local
+    /// LOGICAL px. On a scale-2 display the two differ by exactly the output
+    /// scale, which put every input region at twice its size and offset (so
+    /// clicks missed the image entirely) and made every drop land at half its
+    /// distance from the patch origin.
+    fn logical_per_virtual(&self) -> f64 {
+        let ui = cce_ui::scale::scale_factor() as f64;
+        if ui > 0.0 {
+            self.scale / ui
+        } else {
+            self.scale
+        }
+    }
+}
+
 /// An in-flight item drag.
 ///
 /// The item follows pointer DELTAS, not `patch + position`. The compositor can
@@ -480,8 +500,9 @@ impl Application for GridApp {
         // The drop point in world coordinates — the inverse of the mapping
         // `paint` uses to place cells, so the image lands under the cursor
         // whatever the camera is doing.
-        let vx = patch.x + pos.x as f64 / patch.scale;
-        let vy = patch.y + pos.y as f64 / patch.scale;
+        let s = patch.logical_per_virtual();
+        let vx = patch.x + pos.x as f64 / s;
+        let vy = patch.y + pos.y as f64 / s;
 
         // Sized to fit inside one grid cell, keeping aspect: a phone
         // screenshot would otherwise land several squares wide.
@@ -539,19 +560,20 @@ impl Application for GridApp {
         if p.scale <= 0.0 {
             return Some(Vec::new());
         }
-        Some(
-            self.items
-                .iter()
-                .map(|(item, _)| {
-                    (
-                        ((item.x - p.x) * p.scale).round() as i32,
-                        ((item.y - p.y) * p.scale).round() as i32,
-                        (item.w * p.scale).round().max(1.0) as i32,
-                        (item.h * p.scale).round().max(1.0) as i32,
-                    )
-                })
-                .collect(),
-        )
+        let s = p.logical_per_virtual();
+        let out: Vec<(i32, i32, i32, i32)> = self
+            .items
+            .iter()
+            .map(|(item, _)| {
+                (
+                    ((item.x - p.x) * s).round() as i32,
+                    ((item.y - p.y) * s).round() as i32,
+                    (item.w * s).round().max(1.0) as i32,
+                    (item.h * s).round().max(1.0) as i32,
+                )
+            })
+            .collect();
+        Some(out)
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
@@ -569,8 +591,9 @@ impl Application for GridApp {
             drag.last_origin = origin;
             return;
         }
-        let dx = (pos.x - last_pos.0) as f64 / p.scale;
-        let dy = (pos.y - last_pos.1) as f64 / p.scale;
+        let s = p.logical_per_virtual();
+        let dx = (pos.x - last_pos.0) as f64 / s;
+        let dy = (pos.y - last_pos.1) as f64 / s;
         if dx == 0.0 && dy == 0.0 {
             return;
         }
@@ -598,8 +621,9 @@ impl Application for GridApp {
             if state != ElementState::Pressed {
                 return None;
             }
-            let vx = p.x + pos.x as f64 / p.scale;
-            let vy = p.y + pos.y as f64 / p.scale;
+            let s = p.logical_per_virtual();
+            let vx = p.x + pos.x as f64 / s;
+            let vy = p.y + pos.y as f64 / s;
             let hit = self.items.iter().rposition(|(i, _)| {
                 vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h
             })?;
@@ -623,8 +647,9 @@ impl Application for GridApp {
         }
         match state {
             ElementState::Pressed => {
-                let vx = p.x + pos.x as f64 / p.scale;
-                let vy = p.y + pos.y as f64 / p.scale;
+                let s = p.logical_per_virtual();
+                let vx = p.x + pos.x as f64 / s;
+                let vy = p.y + pos.y as f64 / s;
                 // Last drawn is on top, so search backwards and take the
                 // first hit.
                 let hit = self.items.iter().rposition(|(i, _)| {
