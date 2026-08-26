@@ -78,12 +78,49 @@ pub enum Payload {
     Bytes(Vec<u8>),
 }
 
+/// The `src` of the first `<img>` in a fragment of HTML. Browsers offer
+/// `text/html` alongside the URL flavours, and it is the only one that names
+/// the IMAGE when the image is wrapped in a link — which is exactly how a
+/// Google Images thumbnail is marked up, so `text/uri-list` there is the
+/// result page, not the picture.
+fn img_src(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(tag) = lower[from..].find("<img") {
+        let tag = from + tag;
+        let rest = &lower[tag..];
+        let end = rest.find('>').map(|e| tag + e).unwrap_or(lower.len());
+        if let Some(src) = lower[tag..end].find("src") {
+            let after = tag + src + 3;
+            let seg = &html[after..end.min(html.len())];
+            // src = "..." | '...' | bare
+            let seg = seg.trim_start().strip_prefix('=')?.trim_start();
+            let value = match seg.chars().next() {
+                Some('"') => seg[1..].split('"').next(),
+                Some('\'') => seg[1..].split('\'').next(),
+                _ => seg.split_whitespace().next(),
+            };
+            if let Some(v) = value {
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        from = end.max(tag + 4);
+    }
+    None
+}
+
 /// Interpret a drop by mime type. Browsers hand over a *link* for an image on
 /// a page — the pixels only travel directly when the source made them itself
 /// (a canvas, an image editor), which is why both shapes are handled.
 pub fn parse_payload(mime: &str, data: &[u8]) -> Option<Payload> {
     if mime.starts_with("image/") {
         return Some(Payload::Bytes(data.to_vec()));
+    }
+    if mime.starts_with("text/html") {
+        let html = String::from_utf8_lossy(data);
+        return img_src(&html).map(Payload::Uri);
     }
     let text = if mime == "text/x-moz-url" {
         // Firefox's own flavour is UTF-16LE, "url\ntitle".
@@ -178,6 +215,23 @@ pub fn fetch(payload: Payload) -> std::io::Result<(Vec<u8>, String)> {
             let ext = extension_for(&bytes);
             Ok((bytes, format!("dropped-image.{ext}")))
         }
+        // Inline data, the way Google Images serves its thumbnails. No fetch
+        // to do — the bytes are in the URI.
+        Payload::Uri(uri) if uri.starts_with("data:") => {
+            let rest = &uri["data:".len()..];
+            let (meta, body) = rest.split_once(',').ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed data: URI")
+            })?;
+            let bytes = if meta.ends_with(";base64") {
+                decode_base64(body).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "bad base64 in data: URI")
+                })?
+            } else {
+                percent_decode(body).into_bytes()
+            };
+            let ext = extension_for(&bytes);
+            Ok((bytes, format!("dropped-image.{ext}")))
+        }
         Payload::Uri(uri) if uri.starts_with("file://") => {
             let path = percent_decode(uri.trim_start_matches("file://"));
             let bytes = std::fs::read(&path)?;
@@ -221,6 +275,37 @@ pub fn fetch(payload: Payload) -> std::io::Result<(Vec<u8>, String)> {
     }
 }
 
+/// Standard base64 (RFC 4648) to bytes, tolerating whitespace and padding.
+/// Hand-rolled rather than pulled in: it is twenty lines, and the only user
+/// is `data:` URIs.
+fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    for c in s.bytes() {
+        if c.is_ascii_whitespace() || c == b'=' {
+            continue;
+        }
+        acc = (acc << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Save bytes into the desktop folder under a non-colliding name.
 pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
     let dir = desktop_dir();
@@ -228,6 +313,18 @@ pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
     let path = unique_path(&dir, name);
     std::fs::write(&path, bytes)?;
     Ok(path)
+}
+
+/// Tell the user a drop failed, and why. A drop that silently does nothing
+/// is indistinguishable from one the desktop never received, so every failure
+/// path goes through here rather than only into the log.
+pub fn report_failure(reason: &str) {
+    log::warn!("[items] drop failed: {reason}");
+    let _ = std::process::Command::new("ccectl")
+        .args(["notify", "Image not added to the desktop", reason])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Decode to straight RGBA8 for `cce_ui::vk::upload_rgba`.
@@ -276,6 +373,57 @@ mod tests {
         assert_eq!(file_name_for("https://x.com/a/photo%20one.jpg", "jpg"), "photo one.jpg");
         // No filename in the path at all.
         assert_eq!(file_name_for("https://x.com/render?id=9", "png"), "dropped-image.png");
+    }
+
+    #[test]
+    fn html_flavour_names_the_image_not_the_link() {
+        // A Google-Images-shaped fragment: the <img> is inside an <a>, so the
+        // link URL is useless and only the img src names the picture.
+        let html = br#"<a href="/imgres?q=cat"><img src="https://x.com/cat.png" alt="c"></a>"#;
+        let Some(Payload::Uri(u)) = parse_payload("text/html", html) else {
+            panic!("expected a URI")
+        };
+        assert_eq!(u, "https://x.com/cat.png");
+        // Single quotes and no quotes both parse.
+        let Some(Payload::Uri(u)) = parse_payload("text/html", b"<img src='/a.png'>") else {
+            panic!()
+        };
+        assert_eq!(u, "/a.png");
+        // Markup with no image at all is not a drop we can use.
+        assert!(parse_payload("text/html", b"<p>hello</p>").is_none());
+    }
+
+    #[test]
+    fn data_uris_carry_their_own_bytes() {
+        // "PNG" magic, base64'd, as an inline thumbnail arrives.
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d];
+        let b64 = {
+            const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut o = String::new();
+            for c in png.chunks(3) {
+                let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+                let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+                for i in 0..4 {
+                    if i <= c.len() {
+                        o.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                    } else {
+                        o.push('=');
+                    }
+                }
+            }
+            o
+        };
+        let uri = format!("data:image/png;base64,{b64}");
+        let (bytes, name) = fetch(Payload::Uri(uri)).expect("data: URI decodes");
+        assert_eq!(&bytes[..5], &png[..]);
+        assert_eq!(name, "dropped-image.png");
+    }
+
+    #[test]
+    fn base64_roundtrips_known_vectors() {
+        assert_eq!(decode_base64("TWFu").unwrap(), b"Man".to_vec());
+        assert_eq!(decode_base64("TWE=").unwrap(), b"Ma".to_vec());
+        assert_eq!(decode_base64("TW E =\n").unwrap(), b"Ma".to_vec());
     }
 
     #[test]

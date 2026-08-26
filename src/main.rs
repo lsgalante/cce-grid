@@ -393,8 +393,18 @@ impl Application for GridApp {
     /// bytes if the source has them, else a link to fetch.
     fn drop_mimes(&self) -> &'static [&'static str] {
         &[
+            // Pixels beat links: no fetch, no ambiguity. Firefox offers these
+            // for an image on a page; Chrome usually does not.
             "image/png",
             "image/jpeg",
+            "image/gif",
+            "image/webp",
+            // Preferred over text/uri-list because it names the IMAGE. When a
+            // thumbnail is wrapped in a link — Google Images' exact markup —
+            // uri-list is the result page and fetching it yields HTML, not a
+            // picture. For an unwrapped image the two agree, so this never
+            // does worse.
+            "text/html",
             "text/uri-list",
             "text/x-moz-url",
             "text/plain;charset=utf-8",
@@ -413,7 +423,10 @@ impl Application for GridApp {
         if patch.scale <= 0.0 {
             return;
         }
-        let Some(payload) = items::parse_payload(mime, data) else { return };
+        let Some(payload) = items::parse_payload(mime, data) else {
+            items::report_failure(&format!("nothing usable in the dropped {mime}"));
+            return;
+        };
 
         // The drop point in world coordinates — the inverse of the mapping
         // `paint` uses to place cells, so the image lands under the cursor
@@ -426,16 +439,20 @@ impl Application for GridApp {
         let st = style();
         let (cell_w, cell_h) = (st.cell_w.max(16.0), st.cell_h.max(16.0));
         let sender = self.sender.clone();
+        let mime = mime.to_string();
         std::thread::spawn(move || {
             let (bytes, name) = match items::fetch(payload) {
                 Ok(v) => v,
                 Err(e) => {
-                    log::warn!("[items] fetch failed: {e}");
+                    items::report_failure(&format!("could not fetch it: {e}"));
                     return;
                 }
             };
             let Some((pixels, px_w, px_h)) = items::decode_rgba(&bytes) else {
-                log::warn!("[items] dropped data is not a decodable image");
+                items::report_failure(&format!(
+                    "the dropped {mime} is not an image cce can read ({} bytes)",
+                    bytes.len()
+                ));
                 return;
             };
             // Save even though it is already decoded: the user asked for the
@@ -443,7 +460,7 @@ impl Application for GridApp {
             let path = match items::save_to_desktop(&bytes, &name) {
                 Ok(p) => p,
                 Err(e) => {
-                    log::warn!("[items] could not save to the desktop folder: {e}");
+                    items::report_failure(&format!("could not save it to the desktop: {e}"));
                     return;
                 }
             };
@@ -506,6 +523,10 @@ impl Application for GridApp {
 }
 
 fn main() {
-    env_logger::init();
+    // Default to info, not env_logger's error-only: this process runs
+    // unattended as a session service, and a drop that quietly fails with
+    // nothing in the log is indistinguishable from a drop that never
+    // happened — which is exactly how the first Chrome failure presented.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     cce_ui::engine::run::<GridApp>();
 }
