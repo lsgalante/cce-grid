@@ -315,6 +315,28 @@ pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Resolve a cce binary that is installed beside this one.
+///
+/// This process runs as a systemd user service, whose PATH is
+/// `/usr/local/bin:/usr/bin` — `~/.local/bin`, where every cce binary is
+/// installed, is NOT on it. Spawning one by bare name therefore fails with
+/// ENOENT under systemd while working perfectly from a shell or when the
+/// compositor spawns it, which is exactly how the context menu shipped
+/// broken: it worked in every test and never once on the real desktop.
+fn de_bin(name: &str) -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join(name);
+            if beside.exists() {
+                return beside;
+            }
+        }
+    }
+    // Fall back to PATH: a dev build run straight out of target/ has no cce
+    // binaries beside it, but does have them on PATH.
+    std::path::PathBuf::from(name)
+}
+
 /// Show the context menu for one desktop item and return the chosen action
 /// id, if any. Runs on a worker thread: it blocks until the menu closes.
 ///
@@ -326,7 +348,7 @@ pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
 pub fn item_menu(name: &str) -> Option<String> {
     use std::io::Write;
 
-    let loc = std::process::Command::new("ccectl").arg("pointer-location").output().ok()?;
+    let loc = std::process::Command::new(de_bin("ccectl")).arg("pointer-location").output().ok()?;
     let loc = String::from_utf8_lossy(&loc.stdout);
     let coord = |key: &str| -> Option<i32> {
         loc.split_whitespace()
@@ -344,7 +366,7 @@ pub fn item_menu(name: &str) -> Option<String> {
         serde_json::to_string(name).ok()?
     );
 
-    let mut child = std::process::Command::new("cce-cloud")
+    let mut child = std::process::Command::new(de_bin("cce-cloud"))
         .args(["--json", "-x", &x.to_string(), "-y", &y.to_string()])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -362,7 +384,7 @@ pub fn item_menu(name: &str) -> Option<String> {
 /// path goes through here rather than only into the log.
 pub fn report_failure(reason: &str) {
     log::warn!("[items] drop failed: {reason}");
-    let _ = std::process::Command::new("ccectl")
+    let _ = std::process::Command::new(de_bin("ccectl"))
         .args(["notify", "Image not added to the desktop", reason])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
