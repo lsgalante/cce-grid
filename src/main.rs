@@ -53,6 +53,9 @@ struct GridApp {
     items: Vec<(items::DesktopItem, Option<u32>)>,
     /// Worker threads post finished drops back through this.
     sender: calloop::channel::Sender<Message>,
+    /// The item being dragged, and where inside it the pointer grabbed —
+    /// held in VIRTUAL units so the drag survives a pan or zoom mid-gesture.
+    dragging: Option<Drag>,
     /// The raw `(relief)` string currently installed process-wide (depth +
     /// wall profile LUT) — a change detector, so the registry is only
     /// touched when the config value actually changes.
@@ -60,6 +63,27 @@ struct GridApp {
     /// The DE-wide `bevel_depth` captured before the first spec override,
     /// restored if the key later reverts to a plain width or is removed.
     base_depth: Option<f32>,
+}
+
+/// An in-flight item drag.
+///
+/// The item follows pointer DELTAS, not `patch + position`. The compositor can
+/// re-issue the grid patch at any moment — it did so on the very first motion
+/// event of a drag during testing, moving the patch origin by half a screen —
+/// and the pointer events in flight are still in the OLD surface's coordinate
+/// space, so an absolute mapping teleports the item by the origin delta. A
+/// delta is the same number in either space.
+struct Drag {
+    index: usize,
+    /// Previous pointer position, surface-local.
+    last_pos: (f32, f32),
+    /// Patch origin the previous position was measured against. When this
+    /// changes, the incoming position is in a different space than the last
+    /// one, so that step is used only to re-baseline.
+    last_origin: (f64, f64),
+    /// Set once the pointer actually travels, so a plain click does not
+    /// rewrite the sidecar.
+    moved: bool,
 }
 
 /// The `line_relief` key's three states — see [`Style::line_relief`].
@@ -322,6 +346,7 @@ impl Application for GridApp {
             patch: None,
             items: items::load().into_iter().map(|i| (i, None)).collect(),
             sender: _sender,
+            dragging: None,
             applied_relief: None,
             base_depth: None,
         }
@@ -479,17 +504,114 @@ impl Application for GridApp {
         });
     }
 
-    // The grid layer is input-transparent compositor-side; nothing but a drag
-    // ever reaches these.
-    fn handle_pointer_move(&mut self, _pos: LogicalPosition, _needs_rebuild: &mut bool) {}
+    /// Exactly the pinned items, in surface-local px. Everything else on this
+    /// surface stays click-through: the compositor no longer forces the grid
+    /// layer transparent, it just misses this region, so the desktop keeps its
+    /// background clicks (menu, overview exit, panning) while a press ON an
+    /// image reaches this client. An empty region — the no-items case — is
+    /// wholly transparent, which is the old behaviour exactly.
+    fn input_regions(&self) -> Option<Vec<(i32, i32, i32, i32)>> {
+        let Some(p) = self.patch else { return Some(Vec::new()) };
+        if p.scale <= 0.0 {
+            return Some(Vec::new());
+        }
+        Some(
+            self.items
+                .iter()
+                .map(|(item, _)| {
+                    (
+                        ((item.x - p.x) * p.scale).round() as i32,
+                        ((item.y - p.y) * p.scale).round() as i32,
+                        (item.w * p.scale).round().max(1.0) as i32,
+                        (item.h * p.scale).round().max(1.0) as i32,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        let Some(drag) = self.dragging.as_mut() else { return };
+        let Some(p) = self.patch else { return };
+        if p.scale <= 0.0 {
+            return;
+        }
+        let origin = (p.x, p.y);
+        let last_pos = drag.last_pos;
+        drag.last_pos = (pos.x, pos.y);
+        if drag.last_origin != origin {
+            // The surface moved under the pointer; this position cannot be
+            // compared with the previous one. Re-baseline and wait.
+            drag.last_origin = origin;
+            return;
+        }
+        let dx = (pos.x - last_pos.0) as f64 / p.scale;
+        let dy = (pos.y - last_pos.1) as f64 / p.scale;
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        drag.moved = true;
+        let index = drag.index;
+        if let Some((item, _)) = self.items.get_mut(index) {
+            item.x += dx;
+            item.y += dy;
+            *needs_rebuild = true;
+        }
+    }
 
     fn handle_mouse_input(
         &mut self,
-        _button: MouseButton,
-        _state: ElementState,
-        _pos: LogicalPosition,
-        _needs_rebuild: &mut bool,
+        button: MouseButton,
+        state: ElementState,
+        pos: LogicalPosition,
+        needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
+        if button != MouseButton::Left {
+            return None;
+        }
+        let Some(p) = self.patch else { return None };
+        if p.scale <= 0.0 {
+            return None;
+        }
+        match state {
+            ElementState::Pressed => {
+                let vx = p.x + pos.x as f64 / p.scale;
+                let vy = p.y + pos.y as f64 / p.scale;
+                // Last drawn is on top, so search backwards and take the
+                // first hit.
+                let hit = self.items.iter().rposition(|(i, _)| {
+                    vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h
+                })?;
+                // Raise it: the one you grabbed should be the one you see,
+                // and the next press should find it first.
+                let item = self.items.remove(hit);
+                self.items.push(item);
+                self.dragging = Some(Drag {
+                    index: self.items.len() - 1,
+                    last_pos: (pos.x, pos.y),
+                    last_origin: (p.x, p.y),
+                    moved: false,
+                });
+                *needs_rebuild = true;
+            }
+            ElementState::Released => {
+                if let Some(drag) = self.dragging.take() {
+                    if drag.moved {
+                        let model: Vec<items::DesktopItem> =
+                            self.items.iter().map(|(i, _)| i.clone()).collect();
+                        items::save(&model);
+                        if let Some((item, _)) = self.items.get(drag.index) {
+                            log::info!(
+                                "[items] moved {} to ({:.0}, {:.0})",
+                                item.path.display(),
+                                item.x,
+                                item.y
+                            );
+                        }
+                    }
+                }
+            }
+        }
         None
     }
 
