@@ -26,13 +26,59 @@ the lip for the grid alone: a plain integer is the lip width in logical
 px (0 = no lip; unset = follow the DE-wide relief material), and a
 `(relief)` value carries a full custom material — width, depth, and wall
 profile (`cce_ui::relief_spec::ReliefSpec`), installed process-wide by
-this client (it draws nothing else) and edited in place with
+this client (the grid and the desktop items below are all it draws) and
+edited in place with
 `cce-relief --key style.surface.desktop.line_relief`. The compositor
 fallback honors the integer form and a `(relief)` value's width (its
 scenefx chamfer has no custom profile to install). It reads the same `style.surface.desktop.*` /
 backplate-radius keys as the fallback. Keep it that way — no camera
-state, no timers, no input (the surface is input-transparent
-compositor-side).
+state, no timers (`tick` is empty). Input is the one exception, and only
+over the desktop items below; the surface is transparent to the pointer
+everywhere else.
+
+## Desktop items (`src/items.rs`)
+
+Images pinned to the world canvas. The compositor routes a drag over the
+desktop background onto this client (its `Scene::at_including_grid`), so a
+drop arrives at `handle_drop`; `drop_mimes()` declares the accepted flavors in
+preference order. Pixels win whenever they are offered (`image/png`,
+`image/jpeg`, `image/gif`, `image/webp`) — no fetch, no ambiguity. Below them
+`text/html` is preferred over `text/uri-list` because it names the IMAGE: a
+thumbnail wrapped in a link (Google Images' exact markup) puts the result page
+in uri-list, and fetching that yields HTML rather than a picture. For an
+unwrapped image the two agree, so the preference never does worse.
+
+A dropped item is saved into the desktop folder (`$XDG_DESKTOP_DIR` when
+user-dirs exports one, else `~/Desktop`) AND recorded in a sidecar,
+`$XDG_DATA_HOME/cce/desktop-items.json`, with the VIRTUAL-canvas position it
+landed at — so it comes back in the same world spot next session. Fetching
+shells out to `curl` rather than linking an HTTP stack: this process is a
+background renderer that otherwise needs no network at all, and for a
+once-in-a-while user action an async runtime plus a TLS stack would be the
+largest thing in the binary.
+
+Items draw as GPU-textured quads. Decode happens on a worker thread and the
+pixels return through `Message::ItemReady`, because the upload
+(`cce_ui::vk::upload_rgba`) has to happen on the main loop — which is also why
+`renderer_init` re-uploads everything restored from the sidecar.
+
+They are the only reason this client takes input at all. `input_regions()`
+returns exactly the item rects (and an empty list when there is no patch), so
+the pointer passes straight through everywhere else. Over an item, left-drag
+moves it — the grab offset is held in VIRTUAL units, so the gesture survives a
+pan or zoom mid-drag — and right-click opens a one-button `cce-cloud --json`
+popup at `ccectl pointer-location`, whose reply comes back as
+`Message::RemoveItem(path)`. It carries the path rather than an index because
+that menu blocks on its own thread, and the list can be reordered by a drag or
+grown by a drop while it is open.
+
+One trap, spelled out on `Patch::logical_per_virtual`: `Patch::scale` is
+BUFFER px per virtual unit — it already folds in the output scale, which is
+why the paint path uses it directly — while pointer events and input regions
+are surface-local LOGICAL px. On a scale-2 display the two differ by exactly
+the output scale, which put every input region at twice its size and offset
+(clicks missed the image entirely) and landed every drop at half its intended
+position.
 
 This directory is its own git repository (gitsite-published, fetch-only
 origin; committing locally is publishing). `cce-grid.service` autostarts it
