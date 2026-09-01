@@ -72,13 +72,20 @@ popup at `ccectl pointer-location`, whose reply comes back as
 that menu blocks on its own thread, and the list can be reordered by a drag or
 grown by a drop while it is open.
 
-One trap, spelled out on `Patch::logical_per_virtual`: `Patch::scale` is
-BUFFER px per virtual unit — it already folds in the output scale, which is
-why the paint path uses it directly — while pointer events and input regions
-are surface-local LOGICAL px. On a scale-2 display the two differ by exactly
-the output scale, which put every input region at twice its size and offset
-(clicks missed the image entirely) and landed every drop at half its intended
-position.
+One trap, spelled out on `Patch::surface_per_virtual`: pointer events and
+input regions are surface-local px, and for THIS surface that means BUFFER
+px at every output scale — the grid surface is pinned at buffer_scale 1
+(cce-ui ignores scale events for grid apps; patch.scale is the sole
+resolution authority), so `Patch::scale` is the one conversion for paint,
+regions, and pointer math alike. This replaced a `/ui` division that had
+been calibrated against the compositor's old hit-test, which handed out raw
+layout offsets: numerically buffer/ui only at camera zoom 1 on the pow2
+patch quantization, and at any other camera state it displaced the input
+region off the items (presses read as background — in overview they EXITED
+it) and tore the press position apart from the drag deltas, flinging the
+grabbed item thousands of virtual units. The compositor's hit-test speaks
+true surface coordinates since cce-compositor@feab593; do not reintroduce
+output-scale terms here.
 
 This directory is its own git repository (gitsite-published, fetch-only
 origin; committing locally is publishing). `cce-grid.service` autostarts it

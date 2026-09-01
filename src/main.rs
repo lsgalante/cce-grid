@@ -70,22 +70,21 @@ struct GridApp {
 }
 
 impl Patch {
-    /// Surface-local logical px per virtual unit.
+    /// Surface-local px per virtual unit — `Patch::scale` itself.
     ///
-    /// `Patch::scale` is BUFFER px per virtual unit — it already folds in the
-    /// output scale, which is why the paint path uses it directly. Pointer
-    /// events and input regions are not in that space: both are surface-local
-    /// LOGICAL px. On a scale-2 display the two differ by exactly the output
-    /// scale, which put every input region at twice its size and offset (so
-    /// clicks missed the image entirely) and made every drop land at half its
-    /// distance from the patch origin.
-    fn logical_per_virtual(&self) -> f64 {
-        let ui = cce_ui::scale::scale_factor() as f64;
-        if ui > 0.0 {
-            self.scale / ui
-        } else {
-            self.scale
-        }
+    /// The grid surface is PINNED at buffer_scale 1 (cce-ui ignores scale
+    /// events for grid apps; patch.scale is the sole resolution authority),
+    /// so surface-local coordinates ARE buffer px at every output scale:
+    /// pointer events arrive in that space and input regions are interpreted
+    /// in it. The /ui division that used to live here calibrated against the
+    /// compositor's old hit-test, which handed out raw layout offsets —
+    /// numerically buffer/ui only at zoom 1 on the pow2 patch quantization —
+    /// and at any other camera state it displaced the input region off the
+    /// items (presses read as background) and tore the press position apart
+    /// from the drag deltas (the flung-item bug). The compositor now speaks
+    /// true surface coordinates, so the patch scale is used unmodified.
+    fn surface_per_virtual(&self) -> f64 {
+        self.scale
     }
 }
 
@@ -500,7 +499,7 @@ impl Application for GridApp {
         // The drop point in world coordinates — the inverse of the mapping
         // `paint` uses to place cells, so the image lands under the cursor
         // whatever the camera is doing.
-        let s = patch.logical_per_virtual();
+        let s = patch.surface_per_virtual();
         let vx = patch.x + pos.x as f64 / s;
         let vy = patch.y + pos.y as f64 / s;
 
@@ -560,7 +559,7 @@ impl Application for GridApp {
         if p.scale <= 0.0 {
             return Some(Vec::new());
         }
-        let s = p.logical_per_virtual();
+        let s = p.surface_per_virtual();
         let out: Vec<(i32, i32, i32, i32)> = self
             .items
             .iter()
@@ -591,7 +590,7 @@ impl Application for GridApp {
             drag.last_origin = origin;
             return;
         }
-        let s = p.logical_per_virtual();
+        let s = p.surface_per_virtual();
         let dx = (pos.x - last_pos.0) as f64 / s;
         let dy = (pos.y - last_pos.1) as f64 / s;
         if dx == 0.0 && dy == 0.0 {
@@ -621,7 +620,7 @@ impl Application for GridApp {
             if state != ElementState::Pressed {
                 return None;
             }
-            let s = p.logical_per_virtual();
+            let s = p.surface_per_virtual();
             let vx = p.x + pos.x as f64 / s;
             let vy = p.y + pos.y as f64 / s;
             let hit = self.items.iter().rposition(|(i, _)| {
@@ -647,7 +646,7 @@ impl Application for GridApp {
         }
         match state {
             ElementState::Pressed => {
-                let s = p.logical_per_virtual();
+                let s = p.surface_per_virtual();
                 let vx = p.x + pos.x as f64 / s;
                 let vy = p.y + pos.y as f64 / s;
                 // Last drawn is on top, so search backwards and take the
