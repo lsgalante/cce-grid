@@ -8,7 +8,7 @@
 //! of (patch, style config) — no camera state, no timers.
 //!
 //! The look comes from the same config keys the compositor's fallback grid
-//! reads (`style.surface.desktop.*`, backplate corner radius): flat
+//! reads (`style.surface.desktop.*`, root plate corner radius): flat
 //! rounded cells, with the relief on the LINES — the gap rails read as
 //! raised grout (per-cell half-gap-expanded `Recess` rings that abut at
 //! the rail centerlines), while every cell floor stays flat.
@@ -264,7 +264,7 @@ impl GridApp {
         // The relief lives on the LINES, never the cells: each cell's recess
         // rect is expanded past the cell edge so the wall sits in the rail
         // band, rolling down from the rail face to the cell floor. The roll
-        // is the BACKPLATE-EDGE treatment — `layout::bevel_width` clamped to
+        // is the ROOT_PLATE-EDGE treatment — `layout::bevel_width` clamped to
         // a fraction of the rail, the widget convention — so the rail reads
         // as a flat plate face with a narrow lip where it meets each sunken
         // cell. (A half-gap-wide wall turned the whole rail into a ramp and
@@ -275,7 +275,7 @@ impl GridApp {
         // width (0 = no lip), or a full (relief) value carrying its own
         // width/depth/profile. Explicit widths clamp to the half-rail (the
         // rings' geometric budget); the material default keeps the tighter
-        // backplate clamp.
+        // root plate clamp.
         self.sync_relief_material(&st.line_relief);
         let roll = match &st.line_relief {
             LineRelief::Material => {

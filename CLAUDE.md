@@ -31,7 +31,7 @@ edited in place with
 `cce-relief --key style.surface.desktop.line_relief`. The compositor
 fallback honors the integer form and a `(relief)` value's width (its
 scenefx chamfer has no custom profile to install). It reads the same `style.surface.desktop.*` /
-backplate-radius keys as the fallback. Keep it that way — no camera
+root-plate-radius keys as the fallback. Keep it that way — no camera
 state, no timers (`tick` is empty). Input is the one exception, and only
 over the desktop items below; the surface is transparent to the pointer
 everywhere else.
