@@ -67,6 +67,9 @@ struct GridApp {
     /// The DE-wide `bevel_depth` captured before the first spec override,
     /// restored if the key later reverts to a plain width or is removed.
     base_depth: Option<f32>,
+    /// The DE-wide pinned carve height (0 = follow) while a `(relief)` value's
+    /// `h=` is installed, restored when the key reverts.
+    base_height: Option<f32>,
 }
 
 impl Patch {
@@ -201,9 +204,22 @@ impl GridApp {
                 if self.base_depth.is_none() {
                     self.base_depth = Some(cce_ui::layout::bevel_depth());
                 }
-                if let Some(d) = spec.depth {
-                    if let Ok(mut reg) = cce_ui::layout::get_style_registry().write() {
+                if self.base_height.is_none() {
+                    self.base_height = Some(cce_ui::layout::bevel_height().unwrap_or(0.0));
+                }
+                if let Ok(mut reg) = cce_ui::layout::get_style_registry().write() {
+                    if let Some(d) = spec.light {
                         reg.set_float("bevel_depth", d);
+                    }
+                    // A pinned drop (`h=0.5mm`) is a length: stored as one,
+                    // so it re-resolves if the display metric changes.
+                    match spec.height {
+                        Some(h) => reg.set_len("bevel_height", h),
+                        None => {
+                            if let Some(b) = self.base_height {
+                                reg.set_float("bevel_height", b);
+                            }
+                        }
                     }
                 }
                 cce_ui::layout::install_wall_profile_spec(spec.profile.as_deref());
@@ -212,9 +228,12 @@ impl GridApp {
             _ if self.applied_relief.is_some() => {
                 // The key reverted to a plain width or vanished: back to
                 // the DE-wide material the registry still carries.
-                if let Some(d) = self.base_depth.take() {
-                    if let Ok(mut reg) = cce_ui::layout::get_style_registry().write() {
+                if let Ok(mut reg) = cce_ui::layout::get_style_registry().write() {
+                    if let Some(d) = self.base_depth.take() {
                         reg.set_float("bevel_depth", d);
+                    }
+                    if let Some(h) = self.base_height.take() {
+                        reg.set_float("bevel_height", h);
                     }
                 }
                 let global = cce_ui::layout::get_style_registry()
@@ -368,6 +387,7 @@ impl Application for GridApp {
             dragging: None,
             applied_relief: None,
             base_depth: None,
+            base_height: None,
         }
     }
 
