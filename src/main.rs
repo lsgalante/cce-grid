@@ -306,8 +306,6 @@ impl GridApp {
         .max(0.0)
             * s;
         let lip = roll >= 0.5;
-        let ring_radius = radius + roll as f32;
-        let ring_depth = (roll as f32).max(1.0);
 
         // One extra ring of cells beyond the patch: a border cell outside the
         // patch still owns the inner half of the boundary rail's shading.
@@ -331,20 +329,30 @@ impl GridApp {
                     height: (len_h * s) as f32,
                 };
                 pc.rounded_rect(rect, radius, (true, true, true, true), st.cell_color);
-                if lip {
-                    let ring = Rect {
-                        x: rect.x - roll as f32,
-                        y: rect.y - roll as f32,
-                        width: rect.width + 2.0 * roll as f32,
-                        height: rect.height + 2.0 * roll as f32,
-                    };
-                    pc.recess(
-                        ring,
-                        (ring_radius, ring_radius, ring_radius, ring_radius),
-                        ring_depth,
-                    );
-                }
             }
+        }
+        // The relief on the LINES is ONE primitive for the whole patch: a
+        // lattice carve, folded per pixel to the nearest cell, so the rail
+        // between two cells and the crossing where four meet are a single
+        // profile evaluation — true mitres. This replaced one recess ring per
+        // cell: N free overlays whose rounded corners stacked in colour space
+        // at every crossing and read as overlapping effects, and whose ring
+        // walls (straddling a boundary inflated by the roll) overlapped each
+        // other down the rail centre whenever the roll exceeded a quarter
+        // gap. The wall runs from each cell's edge outward over `roll`.
+        if lip {
+            let origin = (
+                ((inset_x + len_w * 0.5 - p.x) * s) as f32,
+                ((inset_y + len_h * 0.5 - p.y) * s) as f32,
+            );
+            pc.lattice(
+                Rect { x: 0.0, y: 0.0, width: size.width as f32, height: size.height as f32 },
+                ((period_x * s) as f32, (period_y * s) as f32),
+                origin,
+                ((len_w * s) as f32, (len_h * s) as f32),
+                radius,
+                (roll as f32).max(1.0),
+            );
         }
 
         // Pinned images sit ON the canvas, so they are placed by the same

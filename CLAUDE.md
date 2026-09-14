@@ -15,13 +15,18 @@ latched a patch yet, and its gap-colored backdrop always draws beneath as
 the safety net beyond patch edges.
 
 Rendering is a pure function of (patch, style config): flat rounded cells,
-with the relief on the LINES — per-cell `Recess` rings expanded by the
-half-gap, so the walls occupy exactly the half-rail around each cell
-(crest at the rail centerline, inner edge concentric with the cell arc)
-and neighboring rings abut without double-shading. Cell floors carry NO
-relief (user decision); the rails read as raised grout. The compositor
-fallback draws the same expanded-ring chamfer so the client latch never
-swaps the grid's material. `style.surface.desktop.line_relief` overrides
+with the relief on the LINES — ONE `Prim::Lattice` for the whole patch
+(cce-ui shader mode 13): the pixel is folded into the grid period and the
+wall is measured from the NEAREST cell's edge outward over the roll, so
+the rail between two cells and the crossing where four meet are a single
+profile evaluation and join as true mitres. It replaced one `Recess` ring
+per cell (2026-09-14): those were N free overlays whose rounded corners
+stacked in colour space at every crossing and read as several overlapping
+effects, and whose walls — straddling a boundary inflated by the roll —
+overlapped each other down the rail centre whenever the roll exceeded a
+quarter gap. Cell floors carry NO relief (user decision); the rails read as
+raised grout. The compositor fallback still draws its expanded-ring scenefx
+chamfer (a different renderer, shown only until this client latches). `style.surface.desktop.line_relief` overrides
 the lip for the grid alone: a plain integer is the lip width in logical
 px (0 = no lip; unset = follow the DE-wide relief material), and a
 `(relief)` value carries a full custom material — width, depth, and wall
