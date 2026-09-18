@@ -77,6 +77,20 @@ popup at `ccectl pointer-location`, whose reply comes back as
 that menu blocks on its own thread, and the list can be reordered by a drag or
 grown by a drop while it is open.
 
+**Resize handles.** The compositor's `adjust` status topic (`on`/`off` as
+window-adjust mode — overview, or Super held — comes and goes) is the one
+thing this client subscribes to (`spawn_adjust_listener`, a plain std
+thread on the status socket, reconnecting with backoff): it never holds
+keyboard focus, so it cannot read Super for itself. While on, every item
+draws four corner discs (`handle_discs`) in the same `style.surface.border`
+colours and `handle_width` as the windows' handles, the hovered one lit;
+a press on a disc starts a `Resize`, which scales the image
+PROPORTIONALLY (the mean of the two edge ratios the drag asks for),
+anchored on the opposite corner, and saves the sidecar on release. A press
+on the body still moves. The discs are sized in virtual units, so they
+scale with the canvas rather than holding a screen size the way the
+compositor's do — this client never learns the camera zoom.
+
 One trap, spelled out on `Patch::surface_per_virtual`: pointer events and
 input regions are surface-local px, and for THIS surface that means BUFFER
 px at every output scale — the grid surface is pinned at buffer_scale 1

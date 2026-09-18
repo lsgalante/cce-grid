@@ -37,6 +37,95 @@ enum Message {
     /// index: the menu is modal on its own thread, and the list can be
     /// reordered by a drag (or grown by a drop) while it is open.
     RemoveItem(std::path::PathBuf),
+    /// The compositor's window-adjust mode (overview, or Super held) came
+    /// on or went off — the `adjust` status topic. While it is on every
+    /// pinned image shows its four corner handles.
+    AdjustMode(bool),
+}
+
+/// Which corner handle of an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Corner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl Corner {
+    const ALL: [Corner; 4] = [Corner::TopLeft, Corner::TopRight, Corner::BottomLeft, Corner::BottomRight];
+
+    /// Which way the corner faces: +1 on the right/bottom edge, -1 on the
+    /// left/top. Dragging the corner by (dx, dy) grows the item by
+    /// (sx*dx, sy*dy).
+    fn sign(self) -> (f64, f64) {
+        match self {
+            Corner::TopLeft => (-1.0, -1.0),
+            Corner::TopRight => (1.0, -1.0),
+            Corner::BottomLeft => (-1.0, 1.0),
+            Corner::BottomRight => (1.0, 1.0),
+        }
+    }
+}
+
+/// An item's corner handles in VIRTUAL units: the disc radius, and each
+/// corner's centre. A disc is tangent to both of its edges — the same
+/// placement the compositor gives a window's corner handles when the
+/// silhouette has no corner radius — and never wider than a quarter of the
+/// image, so a thumbnail is not all handle.
+fn handle_discs(item: &items::DesktopItem, diameter: f64) -> (f64, [(Corner, f64, f64); 4]) {
+    let r = (diameter / 2.0).min(item.w / 4.0).min(item.h / 4.0).max(1.0);
+    let (x0, y0, x1, y1) = (item.x + r, item.y + r, item.x + item.w - r, item.y + item.h - r);
+    (
+        r,
+        [
+            (Corner::TopLeft, x0, y0),
+            (Corner::TopRight, x1, y0),
+            (Corner::BottomLeft, x0, y1),
+            (Corner::BottomRight, x1, y1),
+        ],
+    )
+}
+
+/// Smallest an image may be resized to, in virtual units.
+const MIN_ITEM_SIZE: f64 = 16.0;
+
+/// Subscribe to the compositor's `adjust` status topic and forward every
+/// push as a message, reconnecting with backoff until the socket is there
+/// (the compositor may come up after this service, and restarts at login).
+/// A new subscriber is sent the current state at once, so the very first
+/// line settles whether the handles should already be up.
+fn spawn_adjust_listener(sender: calloop::channel::Sender<Message>) {
+    use std::io::{BufRead, Write};
+    std::thread::spawn(move || {
+        let mut retry_s = 1u64;
+        loop {
+            let path = {
+                let primary = cce_ui::ipc::socket_path("cce-status-interface");
+                if std::path::Path::new(&primary).exists() {
+                    primary
+                } else {
+                    cce_ui::ipc::socket_path("cce-status")
+                }
+            };
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
+                if stream.write_all(b"adjust\n").is_ok() {
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                        retry_s = 1;
+                        let on = line.trim() == "on";
+                        if sender.send(Message::AdjustMode(on)).is_err() {
+                            return;
+                        }
+                        line.clear();
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(retry_s));
+            retry_s = (retry_s * 2).min(30);
+        }
+    });
 }
 
 /// The world region the current buffer must cover, as told by the
@@ -60,6 +149,13 @@ struct GridApp {
     /// The item being dragged, and where inside it the pointer grabbed —
     /// held in VIRTUAL units so the drag survives a pan or zoom mid-gesture.
     dragging: Option<Drag>,
+    /// The compositor's window-adjust mode (`adjust` status topic): while
+    /// on, every item shows its corner handles and a press on one resizes.
+    adjust: bool,
+    /// The corner handle under the pointer, drawn in the hover colour.
+    hover: Option<(usize, Corner)>,
+    /// An in-flight corner resize, delta-driven like `Drag`.
+    resizing: Option<Resize>,
     /// The raw `(relief)` string currently installed process-wide (depth +
     /// wall profile LUT) — a change detector, so the registry is only
     /// touched when the config value actually changes.
@@ -112,6 +208,16 @@ struct Drag {
     moved: bool,
 }
 
+/// An in-flight corner resize. Delta-driven for the same reason `Drag` is:
+/// the patch can be re-issued under the pointer mid-gesture.
+struct Resize {
+    index: usize,
+    corner: Corner,
+    last_pos: (f32, f32),
+    last_origin: (f64, f64),
+    moved: bool,
+}
+
 /// The `line_relief` key's three states — see [`Style::line_relief`].
 enum LineRelief {
     /// Key absent: follow the DE-wide relief material.
@@ -138,6 +244,12 @@ struct Style {
     /// `(relief)` value, or absent = the DE-wide material. Negative integers
     /// mean unset.
     line_relief: LineRelief,
+    /// The image resize handles, from the same `border` keys the windows'
+    /// handles use: diameter in virtual units (logical px at zoom 1), and
+    /// the resting and hovered colours.
+    handle_width: f64,
+    handle_color: [f32; 4],
+    handle_hover_color: [f32; 4],
 }
 
 fn style() -> Style {
@@ -183,6 +295,13 @@ fn style() -> Style {
                 v => LineRelief::Width(v as f64),
             },
         },
+        handle_width: cce_ui::config::get_f32("/style/surface/border/handle_width", 32.0).max(4.0) as f64,
+        handle_color: linear(
+            get_color("/style/surface/border/color_focused").unwrap_or([0.478, 0.635, 0.969, 1.0]),
+        ),
+        handle_hover_color: linear(
+            get_color("/style/surface/border/color_hover").unwrap_or([0.659, 0.780, 0.980, 1.0]),
+        ),
     }
 }
 
@@ -358,7 +477,7 @@ impl GridApp {
         // Pinned images sit ON the canvas, so they are placed by the same
         // world->patch mapping as the cells and drawn after them. The whole
         // grid surface is below every window, so an item never covers an app.
-        for (item, id) in self.items.iter() {
+        for (index, (item, id)) in self.items.iter().enumerate() {
             let Some(id) = *id else { continue };
             let rect = Rect {
                 x: ((item.x - p.x) * s) as f32,
@@ -377,7 +496,50 @@ impl GridApp {
                 continue;
             }
             pc.image(id, rect, 1.0);
+            // Window-adjust mode: the four corner handles, in the same
+            // colours as the windows' handles, the hovered one lit. Sized in
+            // virtual units, so they scale with the canvas rather than
+            // holding a screen size the way the compositor's do — this
+            // client never learns the camera zoom.
+            if self.adjust {
+                let (r, discs) = handle_discs(item, st.handle_width);
+                for (corner, cx, cy) in discs {
+                    let color = if self.hover == Some((index, corner)) {
+                        st.handle_hover_color
+                    } else {
+                        st.handle_color
+                    };
+                    pc.circle(((cx - p.x) * s) as f32, ((cy - p.y) * s) as f32, (r * s) as f32, color);
+                }
+            }
         }
+    }
+}
+
+impl GridApp {
+    /// The corner handle under a virtual-canvas point, topmost item first,
+    /// with a unit of slack around the disc's antialiased rim.
+    fn corner_at(&self, vx: f64, vy: f64) -> Option<(usize, Corner)> {
+        if !self.adjust {
+            return None;
+        }
+        let diameter = style().handle_width;
+        for (index, (item, _)) in self.items.iter().enumerate().rev() {
+            let (r, discs) = handle_discs(item, diameter);
+            let reach = (r + 1.0) * (r + 1.0);
+            for (corner, cx, cy) in discs {
+                let (dx, dy) = (vx - cx, vy - cy);
+                if dx * dx + dy * dy <= reach {
+                    return Some((index, corner));
+                }
+            }
+        }
+        None
+    }
+
+    fn save_items(&self) {
+        let model: Vec<items::DesktopItem> = self.items.iter().map(|(i, _)| i.clone()).collect();
+        items::save(&model);
     }
 }
 
@@ -388,11 +550,15 @@ impl Application for GridApp {
         _qh: &QueueHandle<EngineState<Self>>,
         _sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
+        spawn_adjust_listener(_sender.clone());
         Self {
             patch: None,
             items: items::load().into_iter().map(|i| (i, None)).collect(),
             sender: _sender,
             dragging: None,
+            adjust: false,
+            hover: None,
+            resizing: None,
             applied_relief: None,
             base_depth: None,
             base_height: None,
@@ -440,10 +606,12 @@ impl Application for GridApp {
                 let Some(pos) = self.items.iter().position(|(i, _)| i.path == path) else {
                     return;
                 };
-                // A drag on the removed item cannot outlive it.
+                // A drag or resize on the removed item cannot outlive it.
                 if self.dragging.is_some() {
                     self.dragging = None;
                 }
+                self.resizing = None;
+                self.hover = None;
                 let (item, id) = self.items.remove(pos);
                 if let Some(id) = id {
                     cce_ui::vk::free_image(id);
@@ -454,6 +622,18 @@ impl Application for GridApp {
                 // The file itself stays where it was saved: this unpins the
                 // image from the desktop, it does not delete the user's file.
                 log::info!("[items] removed {} from the desktop", item.path.display());
+                *needs_rebuild = true;
+            }
+            Message::AdjustMode(on) => {
+                if self.adjust == on {
+                    return;
+                }
+                self.adjust = on;
+                if !on {
+                    // A resize in flight finishes on its release; only the
+                    // highlight goes with the handles.
+                    self.hover = None;
+                }
                 *needs_rebuild = true;
             }
         }
@@ -600,12 +780,61 @@ impl Application for GridApp {
     }
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
-        let Some(drag) = self.dragging.as_mut() else { return };
         let Some(p) = self.patch else { return };
         if p.scale <= 0.0 {
             return;
         }
         let origin = (p.x, p.y);
+        let s = p.surface_per_virtual();
+
+        if let Some(rs) = self.resizing.as_mut() {
+            let last_pos = rs.last_pos;
+            rs.last_pos = (pos.x, pos.y);
+            if rs.last_origin != origin {
+                rs.last_origin = origin;
+                return;
+            }
+            let dx = (pos.x - last_pos.0) as f64 / s;
+            let dy = (pos.y - last_pos.1) as f64 / s;
+            if dx == 0.0 && dy == 0.0 {
+                return;
+            }
+            rs.moved = true;
+            let (index, corner) = (rs.index, rs.corner);
+            if let Some((item, _)) = self.items.get_mut(index) {
+                // Corners scale the image PROPORTIONALLY — an image stretched
+                // out of its aspect is a different picture — by the mean of
+                // the two edge ratios the drag asks for, anchored on the
+                // opposite corner.
+                let (sx, sy) = corner.sign();
+                let kw = (item.w + sx * dx) / item.w.max(1.0);
+                let kh = (item.h + sy * dy) / item.h.max(1.0);
+                let k = ((kw + kh) / 2.0).max(MIN_ITEM_SIZE / item.w.max(item.h).max(1.0));
+                let (old_w, old_h) = (item.w, item.h);
+                item.w = (old_w * k).max(MIN_ITEM_SIZE);
+                item.h = old_h * (item.w / old_w.max(1.0));
+                if sx < 0.0 {
+                    item.x += old_w - item.w;
+                }
+                if sy < 0.0 {
+                    item.y += old_h - item.h;
+                }
+                *needs_rebuild = true;
+            }
+            return;
+        }
+
+        let Some(drag) = self.dragging.as_mut() else {
+            // Idle motion: light the handle under the pointer.
+            let vx = p.x + pos.x as f64 / s;
+            let vy = p.y + pos.y as f64 / s;
+            let hover = self.corner_at(vx, vy);
+            if hover != self.hover {
+                self.hover = hover;
+                *needs_rebuild = true;
+            }
+            return;
+        };
         let last_pos = drag.last_pos;
         drag.last_pos = (pos.x, pos.y);
         if drag.last_origin != origin {
@@ -614,7 +843,6 @@ impl Application for GridApp {
             drag.last_origin = origin;
             return;
         }
-        let s = p.surface_per_virtual();
         let dx = (pos.x - last_pos.0) as f64 / s;
         let dy = (pos.y - last_pos.1) as f64 / s;
         if dx == 0.0 && dy == 0.0 {
@@ -673,6 +901,17 @@ impl Application for GridApp {
                 let s = p.surface_per_virtual();
                 let vx = p.x + pos.x as f64 / s;
                 let vy = p.y + pos.y as f64 / s;
+                // A corner handle (adjust mode only) resizes; the body moves.
+                if let Some((index, corner)) = self.corner_at(vx, vy) {
+                    self.resizing = Some(Resize {
+                        index,
+                        corner,
+                        last_pos: (pos.x, pos.y),
+                        last_origin: (p.x, p.y),
+                        moved: false,
+                    });
+                    return None;
+                }
                 // Last drawn is on top, so search backwards and take the
                 // first hit.
                 let hit = self.items.iter().rposition(|(i, _)| {
@@ -691,6 +930,20 @@ impl Application for GridApp {
                 *needs_rebuild = true;
             }
             ElementState::Released => {
+                if let Some(rs) = self.resizing.take() {
+                    if rs.moved {
+                        self.save_items();
+                        if let Some((item, _)) = self.items.get(rs.index) {
+                            log::info!(
+                                "[items] resized {} to {:.0}x{:.0}",
+                                item.path.display(),
+                                item.w,
+                                item.h
+                            );
+                        }
+                    }
+                    return None;
+                }
                 if let Some(drag) = self.dragging.take() {
                     if drag.moved {
                         let model: Vec<items::DesktopItem> =
