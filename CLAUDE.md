@@ -81,9 +81,12 @@ grown by a drop while it is open.
 window-adjust mode — overview, or Super held — comes and goes) is the one
 thing this client subscribes to (`spawn_adjust_listener`, a plain std
 thread on the status socket, reconnecting with backoff): it never holds
-keyboard focus, so it cannot read Super for itself. While on, every item
-draws four corner discs (`handle_discs`) in the same `style.surface.border`
-colours and `handle_width` as the windows' handles, the hovered one lit;
+keyboard focus, so it cannot read Super for itself. While on, the item
+UNDER THE POINTER (`hover_item` — the compositor shows its ring on the
+hovered window the same way) draws four corner discs (`handle_discs`) in
+the same `style.surface.border` colours and `handle_width` as the windows'
+handles, the hovered one lit; a leave arrives as the off-screen move cce-ui
+synthesizes and clears it;
 a press on a disc starts a `Resize`, which scales the image
 PROPORTIONALLY (the mean of the two edge ratios the drag asks for),
 anchored on the opposite corner, and saves the sidecar on release. A press

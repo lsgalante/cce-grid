@@ -150,8 +150,14 @@ struct GridApp {
     /// held in VIRTUAL units so the drag survives a pan or zoom mid-gesture.
     dragging: Option<Drag>,
     /// The compositor's window-adjust mode (`adjust` status topic): while
-    /// on, every item shows its corner handles and a press on one resizes.
+    /// on, the item under the pointer shows its corner handles and a press
+    /// on one resizes.
     adjust: bool,
+    /// The item under the pointer (body or handle) — the one that shows its
+    /// handles, like the compositor's ring on the hovered window. Cleared by
+    /// the off-screen move cce-ui synthesizes on pointer leave, so it drops
+    /// the moment the pointer is on the background or a window.
+    hover_item: Option<usize>,
     /// The corner handle under the pointer, drawn in the hover colour.
     hover: Option<(usize, Corner)>,
     /// An in-flight corner resize, delta-driven like `Drag`.
@@ -496,12 +502,12 @@ impl GridApp {
                 continue;
             }
             pc.image(id, rect, 1.0);
-            // Window-adjust mode: the four corner handles, in the same
-            // colours as the windows' handles, the hovered one lit. Sized in
-            // virtual units, so they scale with the canvas rather than
-            // holding a screen size the way the compositor's do — this
+            // Window-adjust mode: the hovered item's four corner handles, in
+            // the same colours as the windows' handles, the hovered one lit.
+            // Sized in virtual units, so they scale with the canvas rather
+            // than holding a screen size the way the compositor's do — this
             // client never learns the camera zoom.
-            if self.adjust {
+            if self.adjust && self.hover_item == Some(index) {
                 let (r, discs) = handle_discs(item, st.handle_width);
                 for (corner, cx, cy) in discs {
                     let color = if self.hover == Some((index, corner)) {
@@ -517,14 +523,25 @@ impl GridApp {
 }
 
 impl GridApp {
-    /// The corner handle under a virtual-canvas point, topmost item first,
-    /// with a unit of slack around the disc's antialiased rim.
+    /// The topmost item under a virtual-canvas point.
+    fn item_at(&self, vx: f64, vy: f64) -> Option<usize> {
+        self.items
+            .iter()
+            .rposition(|(i, _)| vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h)
+    }
+
+    /// The corner handle under a virtual-canvas point, with a unit of slack
+    /// around the disc's antialiased rim. Only the hovered item's handles
+    /// are up, so only its discs can be hit.
     fn corner_at(&self, vx: f64, vy: f64) -> Option<(usize, Corner)> {
         if !self.adjust {
             return None;
         }
         let diameter = style().handle_width;
         for (index, (item, _)) in self.items.iter().enumerate().rev() {
+            if self.hover_item != Some(index) {
+                continue;
+            }
             let (r, discs) = handle_discs(item, diameter);
             let reach = (r + 1.0) * (r + 1.0);
             for (corner, cx, cy) in discs {
@@ -557,6 +574,7 @@ impl Application for GridApp {
             sender: _sender,
             dragging: None,
             adjust: false,
+            hover_item: None,
             hover: None,
             resizing: None,
             applied_relief: None,
@@ -612,6 +630,7 @@ impl Application for GridApp {
                 }
                 self.resizing = None;
                 self.hover = None;
+                self.hover_item = None;
                 let (item, id) = self.items.remove(pos);
                 if let Some(id) = id {
                     cce_ui::vk::free_image(id);
@@ -825,9 +844,16 @@ impl Application for GridApp {
         }
 
         let Some(drag) = self.dragging.as_mut() else {
-            // Idle motion: light the handle under the pointer.
+            // Idle motion: the item under the pointer gets the handles, and
+            // the handle under it lights. A leave arrives as an off-screen
+            // position and clears both.
             let vx = p.x + pos.x as f64 / s;
             let vy = p.y + pos.y as f64 / s;
+            let item = self.item_at(vx, vy);
+            if item != self.hover_item {
+                self.hover_item = item;
+                *needs_rebuild = true;
+            }
             let hover = self.corner_at(vx, vy);
             if hover != self.hover {
                 self.hover = hover;
@@ -918,9 +944,11 @@ impl Application for GridApp {
                     vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h
                 })?;
                 // Raise it: the one you grabbed should be the one you see,
-                // and the next press should find it first.
+                // and the next press should find it first. The handles
+                // follow it to its new index.
                 let item = self.items.remove(hit);
                 self.items.push(item);
+                self.hover_item = Some(self.items.len() - 1);
                 self.dragging = Some(Drag {
                     index: self.items.len() - 1,
                     last_pos: (pos.x, pos.y),
