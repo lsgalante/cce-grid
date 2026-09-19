@@ -44,7 +44,9 @@ everywhere else.
 ## Desktop items (`src/items.rs`)
 
 Images pinned to the world canvas. The compositor routes a drag over the
-desktop background onto this client (its `Scene::at_including_grid`), so a
+desktop background onto this client (its `Scene::at`, which has hit-tested the
+grid layer through its input region since cce-compositor@b82a0ee — the separate
+`at_including_grid` entry point it used to need is gone), so a
 drop arrives at `handle_drop`; `drop_mimes()` declares the accepted flavors in
 preference order. Pixels win whenever they are offered (`image/png`,
 `image/jpeg`, `image/gif`, `image/webp`) — no fetch, no ambiguity. Below them

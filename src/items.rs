@@ -1,7 +1,8 @@
 // Desktop items: images pinned to the world canvas.
 //
 // A drop on the desktop background lands here (the compositor routes drags
-// over the background onto the grid client — see its `Scene::at_including_grid`).
+// over the background onto the grid client — see its `Scene::at`, which hit-tests
+// the grid layer through its input region since cce-compositor@b82a0ee).
 // Each item is saved to the desktop folder AND recorded in a sidecar with the
 // virtual-canvas position it was dropped at, so it reappears in the same world
 // spot next session. Nothing here touches the GPU: the caller uploads the
