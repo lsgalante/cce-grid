@@ -109,9 +109,12 @@ grabbed item thousands of virtual units. The compositor's hit-test speaks
 true surface coordinates since cce-compositor@feab593; do not reintroduce
 output-scale terms here.
 
-This directory is its own git repository (gitsite-published, fetch-only
-origin; committing locally is publishing). `cce-grid.service` autostarts it
-with the session (WantedBy=cce-session.target); ccebuild installs both.
+This directory is its own git repository whose `origin` is the local
+*bare* repo `~/git/cce-grid.git`: **committing is not publishing —
+`git push origin master` is**, after which `gitsite.timer` republishes it.
+(This crate has no `published` remote; some siblings keep one for the old
+static mirror.) `cce-grid.service` autostarts it with the session
+(WantedBy=cce-session.target); ccebuild installs both.
 
 Corner radii follow the DE-wide convention: the caller widens the nominal
 radius by `cce_ui::layout::corner_span_factor()` (superellipse span
