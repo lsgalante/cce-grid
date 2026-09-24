@@ -1008,6 +1008,8 @@ impl Application for GridApp {
         None
     }
 
+    // style-audit: opt-out the desktop grid overlay draws the compositor cells, not a window
+
     fn display_list(&mut self, size: LogicalSize, _scale: f64) -> Option<DisplayList> {
         let mut pc = PaintCtx::new();
         self.paint(&mut pc, size);
