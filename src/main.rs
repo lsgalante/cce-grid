@@ -41,6 +41,14 @@ enum Message {
     /// on or went off — the `adjust` status topic. While it is on every
     /// pinned image shows its four corner handles.
     AdjustMode(bool),
+    /// The compositor's overview drag-selection is carrying some of the
+    /// pinned images (`selection` status topic, `move <id>:<x>:<y> ...`):
+    /// where each is now, in virtual units. The compositor moves the rects
+    /// it was reported and draws the selection; this side just follows.
+    SelectionMove(Vec<(u64, f64, f64)>),
+    /// The group move released (`drop`): the positions stand, so save the
+    /// sidecar and report the list afresh.
+    SelectionDrop,
 }
 
 /// Which corner handle of an item.
@@ -90,12 +98,18 @@ fn handle_discs(item: &items::DesktopItem, diameter: f64) -> (f64, [(Corner, f64
 /// Smallest an image may be resized to, in virtual units.
 const MIN_ITEM_SIZE: f64 = 16.0;
 
-/// Subscribe to the compositor's `adjust` status topic and forward every
-/// push as a message, reconnecting with backoff until the socket is there
-/// (the compositor may come up after this service, and restarts at login).
-/// A new subscriber is sent the current state at once, so the very first
-/// line settles whether the handles should already be up.
-fn spawn_adjust_listener(sender: calloop::channel::Sender<Message>) {
+/// Subscribe to one of the compositor's status topics and forward every
+/// push through `parse` as a message, reconnecting with backoff until the
+/// socket is there (the compositor may come up after this service, and
+/// restarts at login). `adjust` is a state topic: a new subscriber is sent
+/// the current state at once, so the very first line settles whether the
+/// handles should already be up. `selection` is one-shot: its lines come
+/// only while a group move is carrying this client's images.
+fn spawn_topic_listener(
+    topic: &'static str,
+    sender: calloop::channel::Sender<Message>,
+    parse: fn(&str) -> Option<Message>,
+) {
     use std::io::{BufRead, Write};
     std::thread::spawn(move || {
         let mut retry_s = 1u64;
@@ -109,14 +123,15 @@ fn spawn_adjust_listener(sender: calloop::channel::Sender<Message>) {
                 }
             };
             if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
-                if stream.write_all(b"adjust\n").is_ok() {
+                if stream.write_all(format!("{topic}\n").as_bytes()).is_ok() {
                     let mut reader = std::io::BufReader::new(stream);
                     let mut line = String::new();
                     while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
                         retry_s = 1;
-                        let on = line.trim() == "on";
-                        if sender.send(Message::AdjustMode(on)).is_err() {
-                            return;
+                        if let Some(msg) = parse(line.trim()) {
+                            if sender.send(msg).is_err() {
+                                return;
+                            }
                         }
                         line.clear();
                     }
@@ -126,6 +141,72 @@ fn spawn_adjust_listener(sender: calloop::channel::Sender<Message>) {
             retry_s = (retry_s * 2).min(30);
         }
     });
+}
+
+/// A `selection` topic line: `move <id>:<x>:<y> ...` or `drop`. Anything
+/// else — or a `move` with nothing parseable on it — is ignored.
+fn parse_selection_line(line: &str) -> Option<Message> {
+    let mut words = line.split_whitespace();
+    match words.next()? {
+        "drop" => Some(Message::SelectionDrop),
+        "move" => {
+            let moves: Vec<(u64, f64, f64)> = words
+                .filter_map(|tok| {
+                    let mut f = tok.split(':');
+                    let id = f.next()?.parse::<u64>().ok()?;
+                    let x = f.next()?.parse::<f64>().ok()?;
+                    let y = f.next()?.parse::<f64>().ok()?;
+                    Some((id, x, y))
+                })
+                .collect();
+            if moves.is_empty() {
+                None
+            } else {
+                Some(Message::SelectionMove(moves))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The thread that tells the compositor what is pinned (`grid-items`, the
+/// whole list on every change — see `GridApp::report_items`). Its own
+/// thread because the control socket is request/reply and the reply waits
+/// on the compositor's main loop, which must never stall the paint loop
+/// here; a channel because reports must land in order. A report that
+/// cannot be delivered (the compositor not up yet) is retried with backoff,
+/// and only the LATEST pending report is ever sent — a stale list is worse
+/// than a late one.
+fn spawn_reporter() -> std::sync::mpsc::Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut retry_s = 1u64;
+        let mut pending: Option<String> = None;
+        loop {
+            // Block for the next report unless one is waiting to be
+            // retried, in which case just drain whatever is newer.
+            if pending.is_none() {
+                match rx.recv() {
+                    Ok(line) => pending = Some(line),
+                    Err(_) => return,
+                }
+            }
+            while let Ok(newer) = rx.try_recv() {
+                pending = Some(newer);
+            }
+            let line = pending.take().unwrap_or_default();
+            match cce_ui::ipc::send_command("cce", &line) {
+                Ok(_) => retry_s = 1,
+                Err(e) => {
+                    log::debug!("[items] report not delivered ({e}); retrying in {retry_s}s");
+                    pending = Some(line);
+                    std::thread::sleep(std::time::Duration::from_secs(retry_s));
+                    retry_s = (retry_s * 2).min(30);
+                }
+            }
+        }
+    });
+    tx
 }
 
 /// The world region the current buffer must cover, as told by the
@@ -146,6 +227,10 @@ struct GridApp {
     items: Vec<(items::DesktopItem, Option<u32>)>,
     /// Worker threads post finished drops back through this.
     sender: calloop::channel::Sender<Message>,
+    /// The `grid-items` reports go out through this (`spawn_reporter`).
+    reporter: std::sync::mpsc::Sender<String>,
+    /// The next `DesktopItem::id` to hand out.
+    next_id: u64,
     /// The item being dragged, and where inside it the pointer grabbed —
     /// held in VIRTUAL units so the drag survives a pan or zoom mid-gesture.
     dragging: Option<Drag>,
@@ -593,6 +678,31 @@ impl GridApp {
         let model: Vec<items::DesktopItem> = self.items.iter().map(|(i, _)| i.clone()).collect();
         items::save(&model);
     }
+
+    /// Name an item for the compositor's benefit (`DesktopItem::id`).
+    fn assign_id(&mut self, item: &mut items::DesktopItem) {
+        self.next_id += 1;
+        item.id = self.next_id;
+    }
+
+    /// Tell the compositor what is pinned and where: `grid-items
+    /// <id>:<x>:<y>:<w>:<h> ...`, virtual units, in draw order (last on
+    /// top), the whole list every time. It is what lets the overview
+    /// drag-selection pick images up beside windows and carry them in a
+    /// group move — the compositor otherwise knows the images only as this
+    /// surface's input region. Sent on every change to the list or to a
+    /// rect this client made itself; the compositor moves its own copy
+    /// during a group move and hears the settled list on `drop`.
+    fn report_items(&self) {
+        let mut line = String::from("grid-items");
+        for (item, _) in self.items.iter() {
+            line.push_str(&format!(
+                " {}:{:.2}:{:.2}:{:.2}:{:.2}",
+                item.id, item.x, item.y, item.w, item.h
+            ));
+        }
+        let _ = self.reporter.send(line);
+    }
 }
 
 impl Application for GridApp {
@@ -602,11 +712,16 @@ impl Application for GridApp {
         _qh: &QueueHandle<EngineState<Self>>,
         _sender: calloop::channel::Sender<Self::Message>,
     ) -> Self {
-        spawn_adjust_listener(_sender.clone());
-        Self {
+        spawn_topic_listener("adjust", _sender.clone(), |line| {
+            Some(Message::AdjustMode(line == "on"))
+        });
+        spawn_topic_listener("selection", _sender.clone(), parse_selection_line);
+        let mut app = Self {
             patch: None,
-            items: items::load().into_iter().map(|i| (i, None)).collect(),
+            items: Vec::new(),
             sender: _sender,
+            reporter: spawn_reporter(),
+            next_id: 0,
             dragging: None,
             adjust: false,
             hover_item: None,
@@ -617,7 +732,13 @@ impl Application for GridApp {
             applied_relief: None,
             base_depth: None,
             base_height: None,
+        };
+        for mut item in items::load() {
+            app.assign_id(&mut item);
+            app.items.push((item, None));
         }
+        app.report_items();
+        app
     }
 
     fn settings(&self) -> WindowSettings {
@@ -641,11 +762,35 @@ impl Application for GridApp {
     }
 
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, _exit: &mut bool) {
-        // Rare, and each changes more than one item's rect (a new texture, a
-        // reordered list, every handle): not worth a rect.
-        self.damage = Damage::Full;
+        // A group move step is one pointer event's worth of motion and
+        // records the rects it touched, like a drag of this client's own.
+        // The rest are rare, and each changes more than one item's rect (a
+        // new texture, a reordered list, every handle): not worth a rect.
+        if !matches!(msg, Message::SelectionMove(_)) {
+            self.damage = Damage::Full;
+        }
         match msg {
-            Message::ItemReady { item, pixels, px_w, px_h } => {
+            Message::SelectionMove(moves) => {
+                for (id, x, y) in moves {
+                    let Some(index) = self.items.iter().position(|(i, _)| i.id == id) else {
+                        continue;
+                    };
+                    self.touch(index);
+                    let (item, _) = &mut self.items[index];
+                    item.x = x;
+                    item.y = y;
+                    self.touch(index);
+                }
+                *needs_rebuild = true;
+            }
+            Message::SelectionDrop => {
+                self.save_items();
+                self.report_items();
+                log::info!("[items] group move dropped; sidecar saved");
+                *needs_rebuild = true;
+            }
+            Message::ItemReady { mut item, pixels, px_w, px_h } => {
+                self.assign_id(&mut item);
                 let id = cce_ui::vk::upload_rgba(pixels, px_w, px_h);
                 log::info!(
                     "[items] pinned {} at ({:.0}, {:.0})",
@@ -658,6 +803,7 @@ impl Application for GridApp {
                 let model: Vec<items::DesktopItem> =
                     self.items.iter().map(|(i, _)| i.clone()).collect();
                 items::save(&model);
+                self.report_items();
                 *needs_rebuild = true;
             }
             Message::RemoveItem(path) => {
@@ -681,6 +827,7 @@ impl Application for GridApp {
                 // The file itself stays where it was saved: this unpins the
                 // image from the desktop, it does not delete the user's file.
                 log::info!("[items] removed {} from the desktop", item.path.display());
+                self.report_items();
                 *needs_rebuild = true;
             }
             Message::AdjustMode(on) => {
@@ -801,6 +948,7 @@ impl Application for GridApp {
             let h = px_h as f64 * fit;
             let item = items::DesktopItem {
                 path,
+                id: 0,
                 // Centred on the drop point.
                 x: vx - w / 2.0,
                 y: vy - h / 2.0,
@@ -1021,6 +1169,7 @@ impl Application for GridApp {
                 if let Some(rs) = self.resizing.take() {
                     if rs.moved {
                         self.save_items();
+                        self.report_items();
                         if let Some((item, _)) = self.items.get(rs.index) {
                             log::info!(
                                 "[items] resized {} to {:.0}x{:.0}",
@@ -1046,6 +1195,9 @@ impl Application for GridApp {
                             );
                         }
                     }
+                    // The press raised the item even if it never moved,
+                    // and the compositor's hit test wants the new order.
+                    self.report_items();
                 }
             }
         }

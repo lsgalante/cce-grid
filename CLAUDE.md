@@ -96,6 +96,28 @@ on the body still moves. The discs are sized in virtual units, so they
 scale with the canvas rather than holding a screen size the way the
 compositor's do — this client never learns the camera zoom.
 
+**Selection.** The compositor's overview drag-selection picks the items
+up beside windows and a group move carries them (since 2026-09-30; see
+`cce-compositor/CLAUDE.md`, "Overview drag-selection"). The compositor
+knows the items only as this surface's input region, so this client
+REPORTS them: `grid-items <id>:<x>:<y>:<w>:<h> ...` on the control socket
+(`report_items`), virtual units, the whole list in draw order on every
+change — load, a drop, a remove, a drag or resize of its own (a drag
+release re-reports even unmoved, since the press raised the item and the
+compositor's hit test wants the order). `DesktopItem::id` is a
+per-process counter (`assign_id`, `#[serde(skip)]`): the sidecar's
+identity is the path. Reports go through one thread (`spawn_reporter`) so
+they land in order and a compositor that is not up yet is retried, only
+the latest pending. The other direction is the `selection` status topic
+(`spawn_topic_listener`, which `adjust` now shares): `move <id>:<x>:<y>
+...` sets the positions as a group move steps (rect damage, like a drag of
+this client's own — `Message::SelectionMove`) and `drop` saves the sidecar
+and reports afresh (`Message::SelectionDrop`). The highlight is the
+compositor's, drawn over the image like a window's wash; this client draws
+nothing for it. A press on a selected item never reaches this client (the
+compositor takes it as the group grab); a press on an unselected one drops
+the selection there and arrives here as an ordinary drag.
+
 One trap, spelled out on `Patch::surface_per_virtual`: pointer events and
 input regions are surface-local px, and for THIS surface that means BUFFER
 px at every output scale — the grid surface is pinned at buffer_scale 1

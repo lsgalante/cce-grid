@@ -22,6 +22,12 @@ use std::path::{Path, PathBuf};
 pub struct DesktopItem {
     /// Where the image was saved — the sidecar stores a path, not pixels.
     pub path: PathBuf,
+    /// This process's name for the item in its reports to the compositor
+    /// (`grid-items`), which addresses a group move's `move` lines by it.
+    /// Assigned when the item enters the list (`GridApp::assign_id`); not
+    /// persisted, a path is the identity across sessions.
+    #[serde(skip)]
+    pub id: u64,
     pub x: f64,
     pub y: f64,
     pub w: f64,
