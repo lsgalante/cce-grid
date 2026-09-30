@@ -130,7 +130,7 @@ fn spawn_adjust_listener(sender: calloop::channel::Sender<Message>) {
 
 /// The world region the current buffer must cover, as told by the
 /// compositor: virtual origin/size and surface px per virtual unit.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Patch {
     x: f64,
     y: f64,
@@ -162,6 +162,12 @@ struct GridApp {
     hover: Option<(usize, Corner)>,
     /// An in-flight corner resize, delta-driven like `Drag`.
     resizing: Option<Resize>,
+    /// What changed since the last painted frame — see [`Damage`].
+    damage: Damage,
+    /// Everything the last painted frame was a function of besides the
+    /// items: a frame whose inputs differ is repainted in full, whatever
+    /// `damage` says.
+    painted: Option<(Patch, (f64, f64), String)>,
     /// The raw `(relief)` string currently installed process-wide (depth +
     /// wall profile LUT) — a change detector, so the registry is only
     /// touched when the config value actually changes.
@@ -191,6 +197,22 @@ impl Patch {
     fn surface_per_virtual(&self) -> f64 {
         self.scale
     }
+}
+
+/// What changed on the canvas since the last painted frame, in VIRTUAL
+/// units. The surface is the whole patch — 7552x8160 px on a HiDPI laptop —
+/// and an image dragged across it changes a few hundred pixels a frame;
+/// repainting and re-compositing all sixty million for each pointer event is
+/// what made the drag stutter. So item edits record the rects they touched
+/// (`GridApp::touch`), and `take_damage` hands cce-ui their union.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Damage {
+    /// Nothing the items did.
+    Nothing,
+    /// The union of the item rects touched: (x0, y0, x1, y1).
+    Rect(f64, f64, f64, f64),
+    /// Anything else: repaint it all.
+    Full,
 }
 
 /// An in-flight item drag.
@@ -523,6 +545,19 @@ impl GridApp {
 }
 
 impl GridApp {
+    /// Record that item `index`'s rect, as it is NOW, differs from the last
+    /// painted frame. A move or resize calls it before and after the edit.
+    /// The handle discs lie inside the rect, so they are covered too.
+    fn touch(&mut self, index: usize) {
+        let Some((item, _)) = self.items.get(index) else { return };
+        let (x0, y0, x1, y1) = (item.x, item.y, item.x + item.w, item.y + item.h);
+        self.damage = match self.damage {
+            Damage::Nothing => Damage::Rect(x0, y0, x1, y1),
+            Damage::Rect(a, b, c, d) => Damage::Rect(a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
+            Damage::Full => Damage::Full,
+        };
+    }
+
     /// The topmost item under a virtual-canvas point.
     fn item_at(&self, vx: f64, vy: f64) -> Option<usize> {
         self.items
@@ -577,6 +612,8 @@ impl Application for GridApp {
             hover_item: None,
             hover: None,
             resizing: None,
+            damage: Damage::Full,
+            painted: None,
             applied_relief: None,
             base_depth: None,
             base_height: None,
@@ -604,6 +641,9 @@ impl Application for GridApp {
     }
 
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, _exit: &mut bool) {
+        // Rare, and each changes more than one item's rect (a new texture, a
+        // reordered list, every handle): not worth a rect.
+        self.damage = Damage::Full;
         match msg {
             Message::ItemReady { item, pixels, px_w, px_h } => {
                 let id = cce_ui::vk::upload_rgba(pixels, px_w, px_h);
@@ -820,6 +860,7 @@ impl Application for GridApp {
             }
             rs.moved = true;
             let (index, corner) = (rs.index, rs.corner);
+            self.touch(index);
             if let Some((item, _)) = self.items.get_mut(index) {
                 // Corners scale the image PROPORTIONALLY — an image stretched
                 // out of its aspect is a different picture — by the mean of
@@ -840,6 +881,7 @@ impl Application for GridApp {
                 }
                 *needs_rebuild = true;
             }
+            self.touch(index);
             return;
         }
 
@@ -851,11 +893,18 @@ impl Application for GridApp {
             let vy = p.y + pos.y as f64 / s;
             let item = self.item_at(vx, vy);
             if item != self.hover_item {
+                // The handles leave one item and appear on another.
+                for index in [self.hover_item, item].into_iter().flatten() {
+                    self.touch(index);
+                }
                 self.hover_item = item;
                 *needs_rebuild = true;
             }
             let hover = self.corner_at(vx, vy);
             if hover != self.hover {
+                for (index, _) in [self.hover, hover].into_iter().flatten() {
+                    self.touch(index);
+                }
                 self.hover = hover;
                 *needs_rebuild = true;
             }
@@ -876,11 +925,13 @@ impl Application for GridApp {
         }
         drag.moved = true;
         let index = drag.index;
+        self.touch(index);
         if let Some((item, _)) = self.items.get_mut(index) {
             item.x += dx;
             item.y += dy;
             *needs_rebuild = true;
         }
+        self.touch(index);
     }
 
     fn handle_mouse_input(
@@ -948,6 +999,15 @@ impl Application for GridApp {
                 // follow it to its new index.
                 let item = self.items.remove(hit);
                 self.items.push(item);
+                // Raised over whatever overlapped it, and the handles of
+                // the item that had them are gone.
+                if let Some(index) = self.hover_item {
+                    let index = if index > hit { index - 1 } else { index };
+                    if index != hit {
+                        self.touch(index);
+                    }
+                }
+                self.touch(self.items.len() - 1);
                 self.hover_item = Some(self.items.len() - 1);
                 self.dragging = Some(Drag {
                     index: self.items.len() - 1,
@@ -1014,6 +1074,53 @@ impl Application for GridApp {
         let mut pc = PaintCtx::new();
         self.paint(&mut pc, size);
         Some(pc.finish())
+    }
+
+    /// The item rects touched since the last frame, as one surface rect —
+    /// or None (everything) when the frame's other inputs moved: the patch,
+    /// the surface size, or any style value the paint reads.
+    fn take_damage(&mut self, size: LogicalSize, _scale: f64) -> Option<(f32, f32, f32, f32)> {
+        let damage = std::mem::replace(&mut self.damage, Damage::Nothing);
+        let p = self.patch?;
+        let st = style();
+        let inputs = (
+            p,
+            (size.width as f64, size.height as f64),
+            format!(
+                "{} {} {} {} {} {:?} {:?} {} {:?} {:?} {} {} {:?}",
+                st.cell_w,
+                st.cell_h,
+                st.gap_width,
+                st.cell_inset,
+                st.corner_radius,
+                st.gap_color,
+                st.cell_color,
+                st.handle_width,
+                st.handle_color,
+                st.handle_hover_color,
+                cce_ui::layout::corner_span_factor(),
+                cce_ui::layout::bevel_width(),
+                self.applied_relief,
+            ),
+        );
+        let same = self.painted.as_ref() == Some(&inputs);
+        self.painted = Some(inputs);
+        if !same {
+            return None;
+        }
+        match damage {
+            Damage::Full => None,
+            Damage::Nothing => Some((0.0, 0.0, 0.0, 0.0)),
+            Damage::Rect(x0, y0, x1, y1) => {
+                let s = p.scale;
+                Some((
+                    ((x0 - p.x) * s) as f32,
+                    ((y0 - p.y) * s) as f32,
+                    ((x1 - x0) * s) as f32,
+                    ((y1 - y0) * s) as f32,
+                ))
+            }
+        }
     }
 
     fn clear_color(&self) -> [f32; 4] {
