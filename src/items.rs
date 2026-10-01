@@ -16,27 +16,83 @@
 
 use std::path::{Path, PathBuf};
 
-/// One pinned image, in virtual-surface coordinates (the same space windows
+/// What a desktop item is — one JSON Canvas node (see `board.rs`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Kind {
+    /// An image file, drawn as its pixels.
+    Image(PathBuf),
+    /// A Markdown note, drawn as a card of its content (MarkdownView).
+    Note(PathBuf),
+    /// Any other file: a card with its name.
+    File(PathBuf),
+    /// A text card: Markdown kept in the canvas itself.
+    Text(String),
+    Link(String),
+    /// A labelled frame behind other items; not interactive.
+    Group(String),
+    /// A node type this client does not know, kept so a save returns it.
+    Other(String),
+}
+
+/// A `file` node's kind, by extension.
+pub fn kind_for_file(path: PathBuf) -> Kind {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Kind::Image(path),
+        "md" => Kind::Note(path),
+        _ => Kind::File(path),
+    }
+}
+
+/// One pinned item, in virtual-surface coordinates (the same space windows
 /// and grid squares live in), so items pan and zoom with the desktop.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DesktopItem {
-    /// Where the image was saved — the sidecar stores a path, not pixels.
-    pub path: PathBuf,
+    /// The canvas node id: the identity across sessions and in edges.
+    pub node: String,
+    pub kind: Kind,
     /// This process's name for the item in its reports to the compositor
     /// (`grid-items`), which addresses a group move's `move` lines by it.
-    /// Assigned when the item enters the list (`GridApp::assign_id`); not
-    /// persisted, a path is the identity across sessions.
-    #[serde(skip)]
+    /// Assigned when the item enters the list (`GridApp::assign_id`).
     pub id: u64,
     pub x: f64,
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// JSON Canvas colour (`"1"`–`"6"` or `#rrggbb`), kept as written.
+    pub color: Option<String>,
 }
 
-/// `$XDG_DATA_HOME/cce/desktop-items.json`.
-pub fn sidecar_path() -> PathBuf {
-    cce_ui::config::data_home().join("cce").join("desktop-items.json")
+impl DesktopItem {
+    pub fn new(node: String, kind: Kind, x: f64, y: f64, w: f64, h: f64) -> DesktopItem {
+        DesktopItem { node, kind, id: 0, x, y, w, h, color: None }
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self.kind, Kind::Image(_))
+    }
+
+    /// Groups and unknown nodes take no input and are not reported to the
+    /// compositor: a group spans a region the background must keep.
+    pub fn interactive(&self) -> bool {
+        !matches!(self.kind, Kind::Group(_) | Kind::Other(_))
+    }
+
+    /// A short name for menus and logs.
+    pub fn name(&self) -> String {
+        match &self.kind {
+            Kind::Image(p) | Kind::Note(p) | Kind::File(p) => {
+                p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            }
+            Kind::Text(t) => {
+                let first = t.lines().find(|l| !l.trim().is_empty()).unwrap_or("Text").trim();
+                first.chars().take(40).collect()
+            }
+            Kind::Link(u) => u.clone(),
+            Kind::Group(l) => l.clone(),
+            Kind::Other(t) => t.clone(),
+        }
+    }
 }
 
 /// The desktop folder: `$XDG_DESKTOP_DIR` when the user-dirs config exports
@@ -48,35 +104,6 @@ pub fn desktop_dir() -> PathBuf {
         }
     }
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Desktop")
-}
-
-pub fn load() -> Vec<DesktopItem> {
-    let path = sidecar_path();
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
-    match serde_json::from_str::<Vec<DesktopItem>>(&text) {
-        Ok(items) => items,
-        Err(e) => {
-            // A corrupt sidecar must not cost the user their other items on
-            // the next write, so refuse to start from an empty list: keep the
-            // file untouched and run with nothing until it is fixed.
-            log::error!("[items] {} is unreadable ({e}); not loading or rewriting it", path.display());
-            Vec::new()
-        }
-    }
-}
-
-pub fn save(items: &[DesktopItem]) {
-    let path = sidecar_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(text) = serde_json::to_string_pretty(items) else { return };
-    // Write-then-rename: a crash mid-write would otherwise leave a truncated
-    // sidecar, which is exactly the corrupt-file case above.
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
-    }
 }
 
 /// The URI (or raw image bytes) a drop payload actually carries.
@@ -165,6 +192,11 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A `file://` URI's path part, percent-decoded.
+pub fn percent_decode_path(s: &str) -> PathBuf {
+    PathBuf::from(percent_decode(s))
 }
 
 /// A filename for the saved copy: the URI's last path segment when it looks
@@ -344,15 +376,16 @@ fn de_bin(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// Show the context menu for one desktop item and return the chosen action
-/// id, if any. Runs on a worker thread: it blocks until the menu closes.
+/// Show a context menu titled `title` with `entries` (action id, label) and
+/// return the chosen action id, if any. Runs on a worker thread: it blocks
+/// until the menu closes.
 ///
 /// The menu is a `cce-cloud --json` popup, the same mechanism the desktop and
 /// app context menus use, so it looks and behaves like every other menu in the
 /// DE rather than something this client drew for itself. The pointer's screen
 /// position has to be asked for — a client knows where its own surface was
 /// touched, never where that is on the screen.
-pub fn item_menu(name: &str) -> Option<String> {
+pub fn item_menu(title: &str, entries: &[(&str, &str)]) -> Option<String> {
     use std::io::Write;
 
     let loc = std::process::Command::new(de_bin("ccectl")).arg("pointer-location").output().ok()?;
@@ -365,13 +398,11 @@ pub fn item_menu(name: &str) -> Option<String> {
     };
     let (x, y) = (coord("x=")?, coord("y=")?);
 
-    // The filename is the title so it is clear WHICH image is about to go.
-    let layout = format!(
-        r#"{{"pages":[{{"title":{},"justify":"left","widgets":[
-            {{"type":"button","text":"Remove from Desktop","id":"remove"}}
-        ]}}]}}"#,
-        serde_json::to_string(name).ok()?
-    );
+    let widgets: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(id, label)| serde_json::json!({"type": "button", "text": label, "id": id}))
+        .collect();
+    let layout = serde_json::json!({"pages": [{"title": title, "justify": "left", "widgets": widgets}]}).to_string();
 
     let mut child = std::process::Command::new(de_bin("cce-cloud"))
         .args(["--json", "-x", &x.to_string(), "-y", &y.to_string()])
@@ -384,6 +415,29 @@ pub fn item_menu(name: &str) -> Option<String> {
     let out = child.wait_with_output().ok()?;
     let reply: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     reply.get("button")?.as_str().map(|s| s.to_string())
+}
+
+/// Hand a path or URL to its default app (`xdg-open`), detached.
+pub fn open_externally(target: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Show a note in cce-notes: hand it to the running instance over its
+/// socket, or start one.
+pub fn open_in_notes(path: &Path) {
+    use std::io::{BufRead, BufReader, Write};
+    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(cce_ui::ipc::socket_path("cce-notes")) {
+        if s.write_all(format!("open {}\n", path.display()).as_bytes()).is_ok() {
+            let mut reply = String::new();
+            let _ = BufReader::new(s).read_line(&mut reply);
+            return;
+        }
+    }
+    let _ = std::process::Command::new(de_bin("cce-notes")).arg("open").arg(path).spawn();
 }
 
 /// Tell the user a drop failed, and why. A drop that silently does nothing

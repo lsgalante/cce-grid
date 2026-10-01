@@ -17,10 +17,52 @@ use wayland_client::QueueHandle;
 
 use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
-use cce_ui::scene::paint::{DisplayList, PaintCtx};
+use cce_ui::scene::paint::{Cap, DisplayList, PaintCtx};
+use cce_ui::widget::markdown::{self, Layout as CardLayout, ShapingMeasure, Theme};
 use cce_ui::widget::{ElementState, KeyEvent, MouseButton, MouseScrollDelta};
 
+mod board;
 mod items;
+
+use board::Edge;
+use items::Kind;
+
+/// A note or text card's content box inset, and the label above a card, in
+/// virtual units (logical px at zoom 1).
+const CARD_PAD: f64 = 14.0;
+const CARD_RADIUS: f64 = 10.0;
+const CARD_TEXT: f32 = 15.0;
+const CARD_LABEL: f64 = 13.0;
+/// A new note or text card's size.
+const CARD_W: f64 = 400.0;
+const CARD_H: f64 = 300.0;
+/// Smallest a card may be resized to.
+const MIN_CARD: f64 = 80.0;
+const EDGE_WIDTH: f64 = 2.0;
+const ARROW_LEN: f64 = 14.0;
+/// Two presses on one item within this read as a double-click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// JSON Canvas's six preset colours (Obsidian's), else a `#rrggbb` value.
+fn canvas_color(c: Option<&str>) -> Option<[f32; 4]> {
+    let srgb = match c? {
+        "1" => [0.91, 0.30, 0.33, 1.0],
+        "2" => [0.93, 0.56, 0.24, 1.0],
+        "3" => [0.92, 0.79, 0.27, 1.0],
+        "4" => [0.27, 0.75, 0.42, 1.0],
+        "5" => [0.31, 0.72, 0.82, 1.0],
+        "6" => [0.62, 0.48, 0.91, 1.0],
+        hex => cce_ui::color::parse_hex_rgba(hex)?,
+    };
+    Some(cce_ui::colors::to_linear(srgb))
+}
+
+/// A laid-out card, and what it was laid out from.
+struct CardCache {
+    source: String,
+    width: f64,
+    layout: CardLayout,
+}
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -33,10 +75,16 @@ enum Message {
         px_w: u32,
         px_h: u32,
     },
-    /// The context menu closed on "remove". Carries the path rather than an
-    /// index: the menu is modal on its own thread, and the list can be
-    /// reordered by a drag (or grown by a drop) while it is open.
-    RemoveItem(std::path::PathBuf),
+    /// An item's context menu closed on an action. Carries the canvas node
+    /// id rather than an index: the menu is modal on its own thread, and the
+    /// list can be reordered by a drag (or grown by a drop) while it is open.
+    MenuAction { node: String, action: String },
+    /// A drop that became a card without pixels to upload (a note, text, a
+    /// link): ready to pin.
+    AddItem(items::DesktopItem),
+    /// Files changed in the vault: the board itself (Obsidian, a sync) or a
+    /// note a card shows.
+    VaultChanged(Vec<std::path::PathBuf>),
     /// The compositor's window-adjust mode (overview, or Super held) came
     /// on or went off — the `adjust` status topic. While it is on every
     /// pinned image shows its four corner handles.
@@ -222,9 +270,23 @@ struct Patch {
 
 struct GridApp {
     patch: Option<Patch>,
-    /// Images pinned to the canvas, paired with their uploaded texture id
-    /// (`None` until the renderer exists — see `renderer_init`).
+    /// Everything pinned to the canvas, in z-order, each image paired with
+    /// its uploaded texture id (`None` until the renderer exists — see
+    /// `renderer_init` — and always for cards).
     items: Vec<(items::DesktopItem, Option<u32>)>,
+    /// The links between items (JSON Canvas edges).
+    edges: Vec<Edge>,
+    /// Where items and edges are kept: `Desktop.canvas` in the vault.
+    board: board::Board,
+    _watcher: Option<cce_vault::VaultWatcher>,
+    /// Laid-out note and text cards, by node id.
+    cards: std::collections::HashMap<String, CardCache>,
+    measure: Option<ShapingMeasure>,
+    /// "Connect to…" was picked on this node: the next press on another
+    /// item draws an edge to it.
+    connecting: Option<String>,
+    /// The last press, for double-click: (node, when).
+    last_press: Option<(String, std::time::Instant)>,
     /// Worker threads post finished drops back through this.
     sender: calloop::channel::Sender<Message>,
     /// The `grid-items` reports go out through this (`spawn_reporter`).
@@ -587,28 +649,72 @@ impl GridApp {
             );
         }
 
-        // Pinned images sit ON the canvas, so they are placed by the same
+        // Pinned items sit ON the canvas, so they are placed by the same
         // world->patch mapping as the cells and drawn after them. The whole
         // grid surface is below every window, so an item never covers an app.
-        for (index, (item, id)) in self.items.iter().enumerate() {
-            let Some(id) = *id else { continue };
-            let rect = Rect {
-                x: ((item.x - p.x) * s) as f32,
-                y: ((item.y - p.y) * s) as f32,
-                width: (item.w * s) as f32,
-                height: (item.h * s) as f32,
-            };
-            // Cull off-patch items: at a far zoom-out the patch can hold
-            // hundreds of squares, and an image that is not on it costs a
-            // draw for nothing.
-            if rect.x + rect.width < 0.0
-                || rect.y + rect.height < 0.0
-                || rect.x > size.width as f32
-                || rect.y > size.height as f32
-            {
+        self.layout_cards(&p, size);
+        let screen = |x: f64, y: f64, w: f64, h: f64| Rect {
+            x: ((x - p.x) * s) as f32,
+            y: ((y - p.y) * s) as f32,
+            width: (w * s) as f32,
+            height: (h * s) as f32,
+        };
+        // Cull off-patch items: at a far zoom-out the patch can hold
+        // hundreds of squares, and an item that is not on it costs a draw
+        // for nothing. A margin keeps a card's label (drawn above it).
+        let on_patch = |r: &Rect| {
+            let m = (CARD_LABEL * 2.0 * s) as f32;
+            !(r.x + r.width < -m || r.y + r.height < -m || r.x > size.width as f32 + m || r.y > size.height as f32 + m)
+        };
+        // Groups are frames behind everything else.
+        for (item, _) in &self.items {
+            let Kind::Group(label) = &item.kind else { continue };
+            let r = screen(item.x, item.y, item.w, item.h);
+            if !on_patch(&r) {
                 continue;
             }
-            pc.image(id, rect, 1.0);
+            let mut c = canvas_color(item.color.as_deref()).unwrap_or([0.55, 0.55, 0.6, 1.0]);
+            let rad = (CARD_RADIUS * s) as f32;
+            let mut fill = c;
+            fill[3] = 0.07;
+            c[3] = 0.6;
+            pc.border(r, (rad, rad, rad, rad), fill, c, (2.0 * s).max(1.0) as f32);
+            if !label.is_empty() {
+                let size = (CARD_LABEL * 1.4 * s) as f32;
+                pc.text_with(label.clone(), r.x, r.y - size * 1.5, size, srgb_u8(cce_ui::colors::TEXT_FG), Some("sans-serif".into()), None);
+            }
+        }
+        // Edges under the cards, as Obsidian draws them.
+        self.paint_edges(pc, &p);
+        for (index, (item, id)) in self.items.iter().enumerate() {
+            let rect = screen(item.x, item.y, item.w, item.h);
+            if !on_patch(&rect) {
+                continue;
+            }
+            match &item.kind {
+                Kind::Image(_) => {
+                    if let Some(id) = *id {
+                        pc.image(id, rect, 1.0);
+                    }
+                }
+                Kind::Group(_) | Kind::Other(_) => continue,
+                _ => {
+                    // Text draws after every shape, so an item above cannot
+                    // hide this card's text by covering it: clip the text to
+                    // what no higher item covers instead.
+                    let above: Vec<Rect> = self.items[index + 1..]
+                        .iter()
+                        .filter(|(o, _)| o.interactive())
+                        .map(|(o, _)| screen(o.x, o.y, o.w, o.h))
+                        .collect();
+                    self.paint_card(pc, &p, item, rect, &above)
+                }
+            }
+            // "Connect to…" is waiting for its far end: ring the near one.
+            if self.connecting.as_deref() == Some(item.node.as_str()) {
+                let rad = (CARD_RADIUS * s) as f32;
+                pc.border(rect, (rad, rad, rad, rad), [0.0, 0.0, 0.0, 0.0], st.handle_hover_color, (3.0 * s).max(1.5) as f32);
+            }
             // Window-adjust mode: the hovered item's four corner handles, in
             // the same colours as the windows' handles, the hovered one lit.
             // Sized in virtual units, so they scale with the canvas rather
@@ -627,6 +733,188 @@ impl GridApp {
             }
         }
     }
+
+    /// Lay out every on-patch note and text card that has no layout yet, or
+    /// one for another width or text. A note's text is read here, once;
+    /// a change to it on disk drops the cache (`vault_changed`).
+    fn layout_cards(&mut self, p: &Patch, size: LogicalSize) {
+        let s = p.scale;
+        let mut jobs: Vec<(String, String, f64)> = Vec::new();
+        for (item, _) in &self.items {
+            let width = (item.w - 2.0 * CARD_PAD).max(20.0);
+            let source = match &item.kind {
+                Kind::Note(path) => {
+                    if self.cards.get(&item.node).is_some_and(|c| (c.width - width).abs() < 0.5) {
+                        continue;
+                    }
+                    std::fs::read_to_string(path).unwrap_or_else(|_| format!("*{} is missing*", item.name()))
+                }
+                Kind::Text(t) => t.clone(),
+                Kind::Link(u) => format!("🔗 {u}"),
+                Kind::File(_) => format!("**{}**", item.name()),
+                _ => continue,
+            };
+            let (rx, ry) = ((item.x - p.x) * s, (item.y - p.y) * s);
+            if rx + item.w * s < 0.0 || ry + item.h * s < 0.0 || rx > size.width as f64 || ry > size.height as f64 {
+                continue;
+            }
+            if self.cards.get(&item.node).is_some_and(|c| c.source == source && (c.width - width).abs() < 0.5) {
+                continue;
+            }
+            jobs.push((item.node.clone(), source, width));
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let theme = Theme { body_font: "sans-serif".into(), mono_font: "monospace".into(), size: CARD_TEXT };
+        let m = self.measure.get_or_insert_with(|| ShapingMeasure::new(true));
+        for (node, source, width) in jobs {
+            let blocks = markdown::blocks(&source);
+            // No index here to resolve links against: they all draw as links.
+            let layout = markdown::layout(&blocks, width as f32, &theme, m, &|_| true);
+            self.cards.insert(node, CardCache { source, width, layout });
+        }
+    }
+
+    fn paint_card(&self, pc: &mut PaintCtx, p: &Patch, item: &items::DesktopItem, r: Rect, above: &[Rect]) {
+        let s = p.scale;
+        let rad = (CARD_RADIUS * s) as f32;
+        let border = canvas_color(item.color.as_deref()).unwrap_or([0.42, 0.42, 0.48, 1.0]);
+        pc.border(r, (rad, rad, rad, rad), [0.06, 0.06, 0.08, 1.0], border, (1.5 * s).max(1.0) as f32);
+        // A file card is labelled with its name above it, as in Obsidian.
+        if matches!(item.kind, Kind::Note(_) | Kind::File(_)) {
+            let size = (CARD_LABEL * s) as f32;
+            let name = item.name();
+            let name = name.strip_suffix(".md").unwrap_or(&name).to_string();
+            let strip = Rect { x: r.x, y: r.y - size * 1.8, width: r.width, height: size * 1.8 };
+            for frag in uncovered(strip, above) {
+                pc.clip(frag, |pc| {
+                    pc.text_with(name.clone(), r.x + rad * 0.5, r.y - size * 1.6, size, srgb_u8(cce_ui::colors::TEXT_DIM), Some("sans-serif".into()), None)
+                });
+            }
+        }
+        if let Some(c) = self.cards.get(&item.node) {
+            let pad = (CARD_PAD * s) as f32;
+            let inner = Rect { x: r.x + pad * 0.5, y: r.y + pad * 0.5, width: r.width - pad, height: r.height - pad };
+            for frag in uncovered(inner, above) {
+                pc.clip(frag, |pc| c.layout.paint_scaled(pc, (r.x + pad, r.y + pad), s as f32, frag));
+            }
+        }
+    }
+
+    /// Straight edges between side midpoints, an arrowhead at the far end.
+    fn paint_edges(&self, pc: &mut PaintCtx, p: &Patch) {
+        let s = p.scale;
+        let by_node: std::collections::HashMap<&str, &items::DesktopItem> =
+            self.items.iter().map(|(i, _)| (i.node.as_str(), i)).collect();
+        let to_screen = |(x, y): (f64, f64)| (((x - p.x) * s) as f32, ((y - p.y) * s) as f32);
+        let color = [0.62, 0.62, 0.68, 0.9];
+        let width = (EDGE_WIDTH * s).max(1.0) as f32;
+        // Edges lie under every card, so a label's text is clipped to what
+        // the cards leave uncovered (text would otherwise draw over them).
+        let cards: Vec<Rect> = self
+            .items
+            .iter()
+            .filter(|(i, _)| i.interactive())
+            .map(|(i, _)| Rect {
+                x: ((i.x - p.x) * s) as f32,
+                y: ((i.y - p.y) * s) as f32,
+                width: (i.w * s) as f32,
+                height: (i.h * s) as f32,
+            })
+            .collect();
+        for e in &self.edges {
+            let (Some(a), Some(b)) = (by_node.get(e.from.as_str()), by_node.get(e.to.as_str())) else { continue };
+            let (pa, _) = anchor(a, e.from_side.as_deref(), center(b));
+            let (pb, nb) = anchor(b, e.to_side.as_deref(), center(a));
+            let (sa, sb) = (to_screen(pa), to_screen(pb));
+            pc.vector(sa.0, sa.1, sb.0, sb.1, width, color, Cap::Round);
+            if e.arrow {
+                // The head points into the far node, along its side's normal.
+                let len = ARROW_LEN;
+                let base = (pb.0 + nb.0 * len, pb.1 + nb.1 * len);
+                let perp = (-nb.1 * len * 0.5, nb.0 * len * 0.5);
+                for side in [1.0, -1.0] {
+                    let wing = to_screen((base.0 + perp.0 * side, base.1 + perp.1 * side));
+                    pc.vector(sb.0, sb.1, wing.0, wing.1, width, color, Cap::Round);
+                }
+            }
+            if let Some(label) = e.label.as_deref().filter(|l| !l.is_empty()) {
+                let size = (CARD_LABEL * s) as f32;
+                let mid = ((sa.0 + sb.0) / 2.0, (sa.1 + sb.1) / 2.0);
+                let w = label.chars().count() as f32 * size * 0.55;
+                pc.rounded_rect(
+                    Rect { x: mid.0 - w / 2.0 - 4.0, y: mid.1 - size * 0.7, width: w + 8.0, height: size * 1.4 },
+                    size * 0.3,
+                    (true, true, true, true),
+                    [0.06, 0.06, 0.08, 0.9],
+                );
+                let strip = Rect { x: mid.0 - w / 2.0 - 4.0, y: mid.1 - size * 0.7, width: w + 8.0, height: size * 1.4 };
+                for frag in uncovered(strip, &cards) {
+                    pc.clip(frag, |pc| {
+                        pc.text_with(label.to_string(), mid.0 - w / 2.0, mid.1 - size * 0.5, size, srgb_u8(cce_ui::colors::TEXT_FG), Some("sans-serif".into()), None)
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The parts of `r` that none of `over` covers, as rectangles: each
+/// overlapping rect splits a fragment into up to four bands around it.
+fn uncovered(r: Rect, over: &[Rect]) -> Vec<Rect> {
+    let mut frags = vec![r];
+    for o in over {
+        let mut next = Vec::with_capacity(frags.len());
+        for f in frags {
+            let (fx1, fy1, ox1, oy1) = (f.x + f.width, f.y + f.height, o.x + o.width, o.y + o.height);
+            if o.x >= fx1 || ox1 <= f.x || o.y >= fy1 || oy1 <= f.y {
+                next.push(f);
+                continue;
+            }
+            let (top, bottom) = (o.y.max(f.y), oy1.min(fy1));
+            let bands = [
+                Rect { x: f.x, y: f.y, width: f.width, height: top - f.y },
+                Rect { x: f.x, y: bottom, width: f.width, height: fy1 - bottom },
+                Rect { x: f.x, y: top, width: o.x - f.x, height: bottom - top },
+                Rect { x: ox1, y: top, width: fx1 - ox1, height: bottom - top },
+            ];
+            next.extend(bands.into_iter().filter(|b| b.width > 0.5 && b.height > 0.5));
+        }
+        frags = next;
+    }
+    frags
+}
+
+fn center(i: &items::DesktopItem) -> (f64, f64) {
+    (i.x + i.w / 2.0, i.y + i.h / 2.0)
+}
+
+/// Where an edge meets an item: the midpoint of the named side, or of the
+/// side facing `toward`; with that side's outward normal.
+fn anchor(i: &items::DesktopItem, side: Option<&str>, toward: (f64, f64)) -> ((f64, f64), (f64, f64)) {
+    let (cx, cy) = center(i);
+    let side = side.map(str::to_string).unwrap_or_else(|| {
+        let (dx, dy) = (toward.0 - cx, toward.1 - cy);
+        if dx.abs() * i.h >= dy.abs() * i.w {
+            if dx >= 0.0 { "right" } else { "left" }.to_string()
+        } else if dy >= 0.0 {
+            "bottom".to_string()
+        } else {
+            "top".to_string()
+        }
+    });
+    match side.as_str() {
+        "left" => ((i.x, cy), (-1.0, 0.0)),
+        "top" => ((cx, i.y), (0.0, -1.0)),
+        "bottom" => ((cx, i.y + i.h), (0.0, 1.0)),
+        _ => ((i.x + i.w, cy), (1.0, 0.0)),
+    }
+}
+
+fn srgb_u8(linear: [f32; 4]) -> [u8; 3] {
+    let c = cce_ui::colors::to_srgb(linear);
+    [(c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8]
 }
 
 impl GridApp {
@@ -635,7 +923,28 @@ impl GridApp {
     /// The handle discs lie inside the rect, so they are covered too.
     fn touch(&mut self, index: usize) {
         let Some((item, _)) = self.items.get(index) else { return };
-        let (x0, y0, x1, y1) = (item.x, item.y, item.x + item.w, item.y + item.h);
+        // A card's label sits above it, and an edge's head and label stray
+        // a little past the rects it joins.
+        let m = CARD_LABEL * 2.5 + ARROW_LEN;
+        let (mut x0, mut y0, mut x1, mut y1) = (item.x - m, item.y - m, item.x + item.w + m, item.y + item.h + m);
+        // An edge runs between its two items, so moving one end repaints the
+        // box spanning both.
+        let node = item.node.as_str();
+        for e in &self.edges {
+            let other = if e.from == node {
+                &e.to
+            } else if e.to == node {
+                &e.from
+            } else {
+                continue;
+            };
+            if let Some((o, _)) = self.items.iter().find(|(o, _)| o.node == *other) {
+                x0 = x0.min(o.x - m);
+                y0 = y0.min(o.y - m);
+                x1 = x1.max(o.x + o.w + m);
+                y1 = y1.max(o.y + o.h + m);
+            }
+        }
         self.damage = match self.damage {
             Damage::Nothing => Damage::Rect(x0, y0, x1, y1),
             Damage::Rect(a, b, c, d) => Damage::Rect(a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
@@ -645,9 +954,9 @@ impl GridApp {
 
     /// The topmost item under a virtual-canvas point.
     fn item_at(&self, vx: f64, vy: f64) -> Option<usize> {
-        self.items
-            .iter()
-            .rposition(|(i, _)| vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h)
+        self.items.iter().rposition(|(i, _)| {
+            i.interactive() && vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h
+        })
     }
 
     /// The corner handle under a virtual-canvas point, with a unit of slack
@@ -674,9 +983,185 @@ impl GridApp {
         None
     }
 
-    fn save_items(&self) {
+    fn save_items(&mut self) {
         let model: Vec<items::DesktopItem> = self.items.iter().map(|(i, _)| i.clone()).collect();
-        items::save(&model);
+        self.board.save(&model, &self.edges);
+    }
+
+    /// Double-click: a note opens in cce-notes, a link or a file in its
+    /// default app.
+    fn activate(&mut self, index: usize) {
+        let Some((item, _)) = self.items.get(index) else { return };
+        match &item.kind {
+            Kind::Note(p) => items::open_in_notes(p),
+            Kind::Image(p) | Kind::File(p) => items::open_externally(&p.to_string_lossy()),
+            Kind::Link(u) => items::open_externally(u),
+            _ => {}
+        }
+    }
+
+    /// Pin a card next to item `index` (or at the patch centre).
+    fn place_beside(&self, index: Option<usize>) -> (f64, f64) {
+        match index.and_then(|i| self.items.get(i)) {
+            Some((it, _)) => (it.x + it.w + 40.0, it.y),
+            None => self.patch.map(|p| (p.x + p.w / 2.0 - CARD_W / 2.0, p.y + p.h / 2.0 - CARD_H / 2.0)).unwrap_or((0.0, 0.0)),
+        }
+    }
+
+    /// A new note in the vault ("Desktop note.md", numbered if taken),
+    /// pinned as a card and opened in cce-notes for writing.
+    fn new_note_card(&mut self, beside: Option<usize>) {
+        let Some(vault) = self.board.vault.clone() else {
+            items::report_failure("note cards need a notes vault (vault { path } in config.kdl)");
+            return;
+        };
+        let mut path = vault.join("Desktop note.md");
+        let mut n = 2;
+        while path.exists() {
+            path = vault.join(format!("Desktop note {n}.md"));
+            n += 1;
+        }
+        if let Err(e) = std::fs::write(&path, "") {
+            items::report_failure(&format!("could not create the note: {e}"));
+            return;
+        }
+        let (x, y) = self.place_beside(beside);
+        let mut item = items::DesktopItem::new(board::new_id(), Kind::Note(path.clone()), x, y, CARD_W, CARD_H);
+        self.assign_id(&mut item);
+        self.items.push((item, None));
+        self.save_items();
+        self.report_items();
+        items::open_in_notes(&path);
+    }
+
+    /// A text card becomes a note in the vault, named by its first line,
+    /// and the card a note card of it — editable in cce-notes, where a
+    /// text card is not editable here at all.
+    fn convert_to_note(&mut self, index: usize) {
+        let Some(vault) = self.board.vault.clone() else { return };
+        let Some((item, _)) = self.items.get(index) else { return };
+        let Kind::Text(text) = item.kind.clone() else { return };
+        let stem: String = item
+            .name()
+            .chars()
+            .map(|c| if "/\\:*?\"<>|#^[]".contains(c) { ' ' } else { c })
+            .collect::<String>()
+            .trim()
+            .trim_start_matches(['#', ' '])
+            .to_string();
+        let stem = if stem.is_empty() { "Desktop note".to_string() } else { stem };
+        let mut path = vault.join(format!("{stem}.md"));
+        let mut n = 2;
+        while path.exists() {
+            path = vault.join(format!("{stem} {n}.md"));
+            n += 1;
+        }
+        if let Err(e) = std::fs::write(&path, &text) {
+            items::report_failure(&format!("could not create the note: {e}"));
+            return;
+        }
+        self.items[index].0.kind = Kind::Note(path);
+        self.cards.remove(&self.items[index].0.node);
+        self.save_items();
+    }
+
+    fn menu_action(&mut self, node: &str, action: &str) {
+        let Some(index) = self.items.iter().position(|(i, _)| i.node == node) else { return };
+        match action {
+            "open" => self.activate(index),
+            "connect" => self.connecting = Some(node.to_string()),
+            "disconnect" => {
+                self.edges.retain(|e| e.from != node && e.to != node);
+                self.save_items();
+            }
+            "new_note" => self.new_note_card(Some(index)),
+            "convert" => self.convert_to_note(index),
+            "remove" => {
+                // A drag or resize on the removed item cannot outlive it.
+                self.dragging = None;
+                self.resizing = None;
+                self.hover = None;
+                self.hover_item = None;
+                let (item, id) = self.items.remove(index);
+                if let Some(id) = id {
+                    cce_ui::vk::free_image(id);
+                }
+                self.edges.retain(|e| e.from != node && e.to != node);
+                self.cards.remove(node);
+                self.save_items();
+                // The file itself stays where it was: this unpins it from the
+                // desktop, it does not delete the user's file.
+                log::info!("[items] removed {} from the desktop", item.name());
+                self.report_items();
+            }
+            _ => {}
+        }
+    }
+
+    /// The board or a card's note changed on disk.
+    fn vault_changed(&mut self, paths: &[std::path::PathBuf]) -> bool {
+        let mut changed = false;
+        // A card's note: lay it out again from the new text.
+        for (item, _) in &self.items {
+            if let Kind::Note(p) = &item.kind {
+                if paths.iter().any(|c| c == p) {
+                    self.cards.remove(&item.node);
+                    changed = true;
+                }
+            }
+        }
+        if paths.iter().any(|c| *c == self.board.path) && self.board.changed_on_disk() {
+            match self.board.read() {
+                Ok((fresh, edges)) => {
+                    // Keep uploaded textures for images that are still there.
+                    let mut old: Vec<(items::DesktopItem, Option<u32>)> = std::mem::take(&mut self.items);
+                    for mut item in fresh {
+                        let tex = old
+                            .iter()
+                            .position(|(o, _)| o.node == item.node && o.kind == item.kind)
+                            .and_then(|i| old.swap_remove(i).1);
+                        self.assign_id(&mut item);
+                        self.items.push((item, tex));
+                    }
+                    for (_, id) in old {
+                        if let Some(id) = id {
+                            cce_ui::vk::free_image(id);
+                        }
+                    }
+                    self.edges = edges;
+                    self.cards.clear();
+                    self.dragging = None;
+                    self.resizing = None;
+                    self.hover = None;
+                    self.hover_item = None;
+                    self.upload_missing();
+                    self.report_items();
+                    log::info!("[board] reloaded {} after an outside edit", self.board.path.display());
+                    changed = true;
+                }
+                Err(e) => log::warn!("[board] {} changed but does not read ({e}); keeping what is shown", self.board.path.display()),
+            }
+        }
+        changed
+    }
+
+    /// Decode and upload images that have no texture yet (restored, or
+    /// arrived by an outside edit).
+    fn upload_missing(&mut self) {
+        for (item, id) in self.items.iter_mut() {
+            if id.is_some() {
+                continue;
+            }
+            let Kind::Image(path) = &item.kind else { continue };
+            let Ok(bytes) = std::fs::read(path) else {
+                log::warn!("[items] {} is gone; not drawing it", path.display());
+                continue;
+            };
+            match items::decode_rgba(&bytes) {
+                Some((pixels, w, h)) => *id = Some(cce_ui::vk::upload_rgba(pixels, w, h)),
+                None => log::warn!("[items] {} did not decode", path.display()),
+            }
+        }
     }
 
     /// Name an item for the compositor's benefit (`DesktopItem::id`).
@@ -695,7 +1180,7 @@ impl GridApp {
     /// during a group move and hears the settled list on `drop`.
     fn report_items(&self) {
         let mut line = String::from("grid-items");
-        for (item, _) in self.items.iter() {
+        for (item, _) in self.items.iter().filter(|(i, _)| i.interactive()) {
             line.push_str(&format!(
                 " {}:{:.2}:{:.2}:{:.2}:{:.2}",
                 item.id, item.x, item.y, item.w, item.h
@@ -716,9 +1201,27 @@ impl Application for GridApp {
             Some(Message::AdjustMode(line == "on"))
         });
         spawn_topic_listener("selection", _sender.clone(), parse_selection_line);
+        let (board, loaded, edges) = board::Board::open();
+        // The board's folder is watched when it is a vault: the board file
+        // itself (an Obsidian edit, a sync) and the notes cards show.
+        let watcher = board.vault.as_ref().and_then(|v| {
+            let tx = _sender.clone();
+            cce_vault::VaultWatcher::spawn(v, move |paths| {
+                let _ = tx.send(Message::VaultChanged(paths));
+            })
+            .map_err(|e| log::warn!("[board] vault watcher: {e}"))
+            .ok()
+        });
         let mut app = Self {
             patch: None,
             items: Vec::new(),
+            edges,
+            board,
+            _watcher: watcher,
+            cards: std::collections::HashMap::new(),
+            measure: None,
+            connecting: None,
+            last_press: None,
             sender: _sender,
             reporter: spawn_reporter(),
             next_id: 0,
@@ -733,7 +1236,7 @@ impl Application for GridApp {
             base_depth: None,
             base_height: None,
         };
-        for mut item in items::load() {
+        for mut item in loaded {
             app.assign_id(&mut item);
             app.items.push((item, None));
         }
@@ -783,6 +1286,26 @@ impl Application for GridApp {
                 }
                 *needs_rebuild = true;
             }
+            Message::MenuAction { node, action } => {
+                self.menu_action(&node, &action);
+                *needs_rebuild = true;
+            }
+            Message::AddItem(mut item) => {
+                self.assign_id(&mut item);
+                log::info!("[items] pinned {} at ({:.0}, {:.0})", item.name(), item.x, item.y);
+                self.items.push((item, None));
+                self.save_items();
+                self.report_items();
+                *needs_rebuild = true;
+            }
+            Message::VaultChanged(paths) => {
+                if self.vault_changed(&paths) {
+                    *needs_rebuild = true;
+                } else {
+                    // Nothing this client shows: keep the frame as it is.
+                    self.damage = Damage::Nothing;
+                }
+            }
             Message::SelectionDrop => {
                 self.save_items();
                 self.report_items();
@@ -792,41 +1315,10 @@ impl Application for GridApp {
             Message::ItemReady { mut item, pixels, px_w, px_h } => {
                 self.assign_id(&mut item);
                 let id = cce_ui::vk::upload_rgba(pixels, px_w, px_h);
-                log::info!(
-                    "[items] pinned {} at ({:.0}, {:.0})",
-                    item.path.display(),
-                    item.x,
-                    item.y
-                );
+                log::info!("[items] pinned {} at ({:.0}, {:.0})", item.name(), item.x, item.y);
                 self.items.push((item, Some(id)));
                 // Persist only the model — the texture id is per-process.
-                let model: Vec<items::DesktopItem> =
-                    self.items.iter().map(|(i, _)| i.clone()).collect();
-                items::save(&model);
-                self.report_items();
-                *needs_rebuild = true;
-            }
-            Message::RemoveItem(path) => {
-                let Some(pos) = self.items.iter().position(|(i, _)| i.path == path) else {
-                    return;
-                };
-                // A drag or resize on the removed item cannot outlive it.
-                if self.dragging.is_some() {
-                    self.dragging = None;
-                }
-                self.resizing = None;
-                self.hover = None;
-                self.hover_item = None;
-                let (item, id) = self.items.remove(pos);
-                if let Some(id) = id {
-                    cce_ui::vk::free_image(id);
-                }
-                let model: Vec<items::DesktopItem> =
-                    self.items.iter().map(|(i, _)| i.clone()).collect();
-                items::save(&model);
-                // The file itself stays where it was saved: this unpins the
-                // image from the desktop, it does not delete the user's file.
-                log::info!("[items] removed {} from the desktop", item.path.display());
+                self.save_items();
                 self.report_items();
                 *needs_rebuild = true;
             }
@@ -851,20 +1343,22 @@ impl Application for GridApp {
     /// and does not replay earlier uploads, so items restored from the sidecar
     /// (and any pinned before the reconnect) have to be handed over again.
     fn renderer_init(&mut self, _renderer: &mut cce_ui::vk::VkRenderer) {
-        for (item, id) in self.items.iter_mut() {
-            let Ok(bytes) = std::fs::read(&item.path) else {
-                log::warn!("[items] {} is gone; not drawing it", item.path.display());
-                *id = None;
-                continue;
-            };
-            match items::decode_rgba(&bytes) {
-                Some((pixels, w, h)) => *id = Some(cce_ui::vk::upload_rgba(pixels, w, h)),
-                None => {
-                    log::warn!("[items] {} did not decode", item.path.display());
-                    *id = None;
-                }
-            }
+        for (_, id) in self.items.iter_mut() {
+            *id = None;
         }
+        self.upload_missing();
+    }
+
+    /// Note cards draw text, which this surface never did before: the
+    /// glyph pass is on, and system fonts carry the sans's bold and italic
+    /// faces (the bundle has only its regular). `ShapingMeasure::new(true)`
+    /// loads the same set.
+    fn display_list_text(&self) -> bool {
+        true
+    }
+
+    fn load_system_fonts(&self) -> bool {
+        true
     }
 
     /// What a browser offers for an image on a page, best first: the raw
@@ -901,9 +1395,46 @@ impl Application for GridApp {
         if patch.scale <= 0.0 {
             return;
         }
+        // Plain text that is not a link or a path becomes a text card,
+        // whole (the URI parsing below would keep only its first line).
+        if mime.starts_with("text/plain") {
+            let text = String::from_utf8_lossy(data).trim().to_string();
+            let first = text.lines().next().unwrap_or("").trim();
+            let linkish = first.contains("://") || first.starts_with('/') || first.starts_with("data:");
+            if !text.is_empty() && !linkish {
+                let s = patch.surface_per_virtual();
+                let (vx, vy) = (patch.x + pos.x as f64 / s, patch.y + pos.y as f64 / s);
+                let item = items::DesktopItem::new(board::new_id(), Kind::Text(text), vx - 125.0, vy - 60.0, 250.0, 120.0);
+                let _ = self.sender.send(Message::AddItem(item));
+                return;
+            }
+        }
         let Some(payload) = items::parse_payload(mime, data) else {
             items::report_failure(&format!("nothing usable in the dropped {mime}"));
             return;
+        };
+        // A Markdown file is a note card: nothing to fetch or decode.
+        if let items::Payload::Uri(uri) = &payload {
+            if let Some(path) = uri.strip_prefix("file://").map(items::percent_decode_path) {
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("md")) {
+                    let s = patch.surface_per_virtual();
+                    let (vx, vy) = (patch.x + pos.x as f64 / s, patch.y + pos.y as f64 / s);
+                    let item = items::DesktopItem::new(
+                        board::new_id(),
+                        Kind::Note(path),
+                        vx - CARD_W / 2.0,
+                        vy - CARD_H / 2.0,
+                        CARD_W,
+                        CARD_H,
+                    );
+                    let _ = self.sender.send(Message::AddItem(item));
+                    return;
+                }
+            }
+        }
+        let link = match &payload {
+            items::Payload::Uri(u) if u.starts_with("http://") || u.starts_with("https://") => Some(u.clone()),
+            _ => None,
         };
 
         // The drop point in world coordinates — the inverse of the mapping
@@ -928,6 +1459,12 @@ impl Application for GridApp {
                 }
             };
             let Some((pixels, px_w, px_h)) = items::decode_rgba(&bytes) else {
+                // A web page rather than a picture: pin it as a link card.
+                if let Some(url) = link {
+                    let item = items::DesktopItem::new(board::new_id(), Kind::Link(url), vx - 150.0, vy - 40.0, 300.0, 80.0);
+                    let _ = sender.send(Message::AddItem(item));
+                    return;
+                }
                 items::report_failure(&format!(
                     "the dropped {mime} is not an image cce can read ({} bytes)",
                     bytes.len()
@@ -946,15 +1483,8 @@ impl Application for GridApp {
             let fit = (cell_w / px_w as f64).min(cell_h / px_h as f64).min(1.0);
             let w = px_w as f64 * fit;
             let h = px_h as f64 * fit;
-            let item = items::DesktopItem {
-                path,
-                id: 0,
-                // Centred on the drop point.
-                x: vx - w / 2.0,
-                y: vy - h / 2.0,
-                w,
-                h,
-            };
+            // Centred on the drop point.
+            let item = items::DesktopItem::new(board::new_id(), Kind::Image(path), vx - w / 2.0, vy - h / 2.0, w, h);
             let _ = sender.send(Message::ItemReady { item, pixels, px_w, px_h });
         });
     }
@@ -974,6 +1504,7 @@ impl Application for GridApp {
         let out: Vec<(i32, i32, i32, i32)> = self
             .items
             .iter()
+            .filter(|(item, _)| item.interactive())
             .map(|(item, _)| {
                 (
                     ((item.x - p.x) * s).round() as i32,
@@ -1015,6 +1546,21 @@ impl Application for GridApp {
                 // the two edge ratios the drag asks for, anchored on the
                 // opposite corner.
                 let (sx, sy) = corner.sign();
+                if !item.is_image() {
+                    // A card has no aspect to keep: each edge follows.
+                    let (old_w, old_h) = (item.w, item.h);
+                    item.w = (old_w + sx * dx).max(MIN_CARD);
+                    item.h = (old_h + sy * dy).max(MIN_CARD);
+                    if sx < 0.0 {
+                        item.x += old_w - item.w;
+                    }
+                    if sy < 0.0 {
+                        item.y += old_h - item.h;
+                    }
+                    *needs_rebuild = true;
+                    self.touch(index);
+                    return;
+                }
                 let kw = (item.w + sx * dx) / item.w.max(1.0);
                 let kh = (item.h + sy * dy) / item.h.max(1.0);
                 let k = ((kw + kh) / 2.0).max(MIN_ITEM_SIZE / item.w.max(item.h).max(1.0));
@@ -1100,20 +1646,31 @@ impl Application for GridApp {
             let s = p.surface_per_virtual();
             let vx = p.x + pos.x as f64 / s;
             let vy = p.y + pos.y as f64 / s;
-            let hit = self.items.iter().rposition(|(i, _)| {
-                vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h
-            })?;
-            let path = self.items[hit].0.path.clone();
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Image".to_string());
+            let hit = self.item_at(vx, vy)?;
+            let item = &self.items[hit].0;
+            let node = item.node.clone();
+            let name = item.name();
+            let mut entries: Vec<(&'static str, &'static str)> = Vec::new();
+            match &item.kind {
+                Kind::Note(_) => entries.push(("open", "Open in Notes")),
+                Kind::Link(_) => entries.push(("open", "Open link")),
+                Kind::Text(_) if self.board.vault.is_some() => entries.push(("convert", "Convert to note")),
+                _ => {}
+            }
+            entries.push(("connect", "Connect to…"));
+            if self.edges.iter().any(|e| e.from == node || e.to == node) {
+                entries.push(("disconnect", "Disconnect"));
+            }
+            if self.board.vault.is_some() {
+                entries.push(("new_note", "New note card"));
+            }
+            entries.push(("remove", "Remove from Desktop"));
             // The menu blocks until it is dismissed, so it cannot run on the
             // loop that has to keep drawing the desktop behind it.
             let sender = self.sender.clone();
             std::thread::spawn(move || {
-                if items::item_menu(&name).as_deref() == Some("remove") {
-                    let _ = sender.send(Message::RemoveItem(path));
+                if let Some(action) = items::item_menu(&name, &entries) {
+                    let _ = sender.send(Message::MenuAction { node, action });
                 }
             });
             return None;
@@ -1126,6 +1683,43 @@ impl Application for GridApp {
                 let s = p.surface_per_virtual();
                 let vx = p.x + pos.x as f64 / s;
                 let vy = p.y + pos.y as f64 / s;
+                // Finishing a "Connect to…": this press names the far end.
+                if let Some(from) = self.connecting.take() {
+                    if let Some(hit) = self.item_at(vx, vy) {
+                        let to = self.items[hit].0.node.clone();
+                        if to != from {
+                            self.edges.push(Edge {
+                                id: board::new_id(),
+                                from,
+                                to,
+                                from_side: None,
+                                to_side: None,
+                                label: None,
+                                arrow: true,
+                            });
+                            self.save_items();
+                            log::info!("[board] connected two items");
+                        }
+                    }
+                    self.damage = Damage::Full;
+                    *needs_rebuild = true;
+                    return None;
+                }
+                // A second press on the same item, quickly: open it.
+                if let Some(hit) = self.item_at(vx, vy) {
+                    let node = self.items[hit].0.node.clone();
+                    let now = std::time::Instant::now();
+                    let double = self
+                        .last_press
+                        .as_ref()
+                        .is_some_and(|(n, at)| *n == node && now.duration_since(*at) < DOUBLE_CLICK);
+                    self.last_press = Some((node, now));
+                    if double {
+                        self.last_press = None;
+                        self.activate(hit);
+                        return None;
+                    }
+                }
                 // A corner handle (adjust mode only) resizes; the body moves.
                 if let Some((index, corner)) = self.corner_at(vx, vy) {
                     self.resizing = Some(Resize {
@@ -1139,9 +1733,7 @@ impl Application for GridApp {
                 }
                 // Last drawn is on top, so search backwards and take the
                 // first hit.
-                let hit = self.items.iter().rposition(|(i, _)| {
-                    vx >= i.x && vx < i.x + i.w && vy >= i.y && vy < i.y + i.h
-                })?;
+                let hit = self.item_at(vx, vy)?;
                 // Raise it: the one you grabbed should be the one you see,
                 // and the next press should find it first. The handles
                 // follow it to its new index.
@@ -1171,28 +1763,16 @@ impl Application for GridApp {
                         self.save_items();
                         self.report_items();
                         if let Some((item, _)) = self.items.get(rs.index) {
-                            log::info!(
-                                "[items] resized {} to {:.0}x{:.0}",
-                                item.path.display(),
-                                item.w,
-                                item.h
-                            );
+                            log::info!("[items] resized {} to {:.0}x{:.0}", item.name(), item.w, item.h);
                         }
                     }
                     return None;
                 }
                 if let Some(drag) = self.dragging.take() {
                     if drag.moved {
-                        let model: Vec<items::DesktopItem> =
-                            self.items.iter().map(|(i, _)| i.clone()).collect();
-                        items::save(&model);
+                        self.save_items();
                         if let Some((item, _)) = self.items.get(drag.index) {
-                            log::info!(
-                                "[items] moved {} to ({:.0}, {:.0})",
-                                item.path.display(),
-                                item.x,
-                                item.y
-                            );
+                            log::info!("[items] moved {} to ({:.0}, {:.0})", item.name(), item.x, item.y);
                         }
                     }
                     // The press raised the item even if it never moved,
@@ -1222,7 +1802,12 @@ impl Application for GridApp {
 
     // style-audit: opt-out the desktop grid overlay draws the compositor cells, not a window
 
-    fn display_list(&mut self, size: LogicalSize, _scale: f64) -> Option<DisplayList> {
+    fn display_list(&mut self, size: LogicalSize, scale: f64) -> Option<DisplayList> {
+        // The runner renders this surface at scale 1 (patch.scale is the
+        // resolution) but the toolkit-wide factor follows the output, and
+        // text shapes at that factor: pin it to this surface's, or every
+        // card's text would shape at twice the size it is placed at.
+        cce_ui::scale::set_scale_factor(scale as f32);
         let mut pc = PaintCtx::new();
         self.paint(&mut pc, size);
         Some(pc.finish())
@@ -1289,4 +1874,36 @@ fn main() {
     // happened — which is exactly how the first Chrome failure presented.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     cce_ui::engine::run::<GridApp>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(rs: &[Rect]) -> f32 {
+        rs.iter().map(|r| r.width * r.height).sum()
+    }
+
+    #[test]
+    fn uncovered_subtracts_overlaps() {
+        let r = Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
+        assert_eq!(uncovered(r, &[]).len(), 1);
+        // A square in the middle leaves the frame around it.
+        let hole = Rect { x: 40.0, y: 40.0, width: 20.0, height: 20.0 };
+        let frags = uncovered(r, &[hole]);
+        assert_eq!(frags.len(), 4);
+        assert!((area(&frags) - (10000.0 - 400.0)).abs() < 0.01);
+        // Covered whole: nothing left. Missed: untouched.
+        assert!(uncovered(r, &[Rect { x: -5.0, y: -5.0, width: 200.0, height: 200.0 }]).is_empty());
+        assert_eq!(uncovered(r, &[Rect { x: 200.0, y: 0.0, width: 10.0, height: 10.0 }]).len(), 1);
+    }
+
+    #[test]
+    fn edges_meet_the_facing_side() {
+        let a = items::DesktopItem::new("a".into(), Kind::Text(String::new()), 0.0, 0.0, 100.0, 50.0);
+        let b = items::DesktopItem::new("b".into(), Kind::Text(String::new()), 300.0, 0.0, 100.0, 50.0);
+        assert_eq!(anchor(&a, None, center(&b)), ((100.0, 25.0), (1.0, 0.0)));
+        assert_eq!(anchor(&b, None, center(&a)), ((300.0, 25.0), (-1.0, 0.0)));
+        assert_eq!(anchor(&a, Some("bottom"), center(&b)), ((50.0, 50.0), (0.0, 1.0)));
+    }
 }

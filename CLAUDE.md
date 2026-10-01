@@ -41,6 +41,60 @@ state, no timers (`tick` is empty). Input is the one exception, and only
 over the desktop items below; the surface is transparent to the pointer
 everywhere else.
 
+## The board (`src/board.rs`) — the desktop as a JSON Canvas
+
+Everything pinned to the desktop lives in ONE JSON Canvas file
+(jsoncanvas.org, Obsidian's `.canvas`): `Desktop.canvas` at the root of
+the notes vault (config.kdl `vault { path }`, as cce-notes reads it), so
+Obsidian and the user's other devices open the desktop as a canvas; with
+no vault, `$XDG_DATA_HOME/cce/desktop.canvas`. Obsidian-on-cce milestone 5.
+
+- **Nodes are items, one to one, node order = z-order.** `file` nodes are
+  images, note cards (`.md`) or plain file cards by extension; `text`,
+  `link`, `group` are their own kinds (`items::Kind`); an unknown type is
+  kept as `Kind::Other`, undrawn, so a newer Obsidian's nodes survive.
+  Edges (`board::Edge`) keep ids, sides, labels and `toEnd`.
+- **A save edits the canvas it read** (`apply_model` over
+  `cce_vault::canvas`, which holds raw field text): untouched fields,
+  unknown keys and number formatting go back byte for byte (a test pins
+  it); a node whose type changed drops the old type's fields.
+- **Paths:** vault-relative inside the vault, absolute outside it. The
+  desktop folder's images are outside, so Obsidian shows those nodes as
+  missing files while cce draws them (user decision, 2026-10-01).
+- **Migration:** the first run with no board converts the old
+  `desktop-items.json` (images only) and renames it `.json.migrated`. An
+  unreadable board is never overwritten: the app runs with nothing.
+- **Outside edits:** a `cce_vault::VaultWatcher` on the vault reloads the
+  board when it changed and this client did not write it (`Board::seen`),
+  keeping textures by node id, and drops a note card's layout when its
+  note changes. The save's temp file is a dot-file so watchers skip it.
+- **Cards** (note, text, link, file) draw through cce-ui's `MarkdownView`
+  (`widget::markdown`, the `markdown` feature): laid out in virtual units
+  (`layout_cards`, cached per node/width/text), painted with
+  `paint_scaled(k = patch.scale)`. Two traps, both fixed here:
+  - **The scale factor.** The runner renders this surface at scale 1 but
+    the toolkit-wide factor follows the output (2 on the laptop), and text
+    shapes at it: `display_list` pins it to the surface's own scale, or
+    text shapes at twice the size it is placed at.
+  - **Text draws over every plate.** A card cannot hide the text of a card
+    below it by covering it, so each card's text (and its label, and edge
+    labels) is clipped to what higher items leave uncovered (`uncovered`,
+    rect subtraction).
+- **Edges** are straight, side midpoint to side midpoint (the named side,
+  or the one facing the other end), with an arrowhead; `touch` damages the
+  box spanning both ends so a drag repaints the line.
+- **Input:** right-click menus by kind (Open in Notes / Open link, Convert
+  to note for a text card, Connect to…, Disconnect, New note card, Remove);
+  "Connect to…" is finished by the next press on another item;
+  double-click opens a note in cce-notes (its socket, or a launch) and a
+  link or file in its default app. Drops: a `.md` file becomes a note
+  card, plain text a text card, a web URL that is not an image a link
+  card. Card corners resize freely; images keep their aspect. Groups take
+  no input and are not reported to the compositor.
+- Text cards are not edited in place (the surface never takes the
+  keyboard): **Convert to note** makes a vault note of one, and **New note
+  card** makes an empty note and opens it in cce-notes.
+
 ## Desktop items (`src/items.rs`)
 
 Images pinned to the world canvas. The compositor routes a drag over the
@@ -55,10 +109,10 @@ thumbnail wrapped in a link (Google Images' exact markup) puts the result page
 in uri-list, and fetching that yields HTML rather than a picture. For an
 unwrapped image the two agree, so the preference never does worse.
 
-A dropped item is saved into the desktop folder (`$XDG_DESKTOP_DIR` when
-user-dirs exports one, else `~/Desktop`) AND recorded in a sidecar,
-`$XDG_DATA_HOME/cce/desktop-items.json`, with the VIRTUAL-canvas position it
-landed at — so it comes back in the same world spot next session. Fetching
+A dropped image is saved into the desktop folder (`$XDG_DESKTOP_DIR` when
+user-dirs exports one, else `~/Desktop`) AND recorded on the board with the
+VIRTUAL-canvas position it landed at — so it comes back in the same world
+spot next session. Fetching
 shells out to `curl` rather than linking an HTTP stack: this process is a
 background renderer that otherwise needs no network at all, and for a
 once-in-a-while user action an async runtime plus a TLS stack would be the
@@ -67,7 +121,7 @@ largest thing in the binary.
 Items draw as GPU-textured quads. Decode happens on a worker thread and the
 pixels return through `Message::ItemReady`, because the upload
 (`cce_ui::vk::upload_rgba`) has to happen on the main loop — which is also why
-`renderer_init` re-uploads everything restored from the sidecar.
+`renderer_init` re-uploads every image restored from the board.
 
 They are the only reason this client takes input at all. `input_regions()`
 returns exactly the item rects (and an empty list when there is no patch), so
@@ -75,9 +129,9 @@ the pointer passes straight through everywhere else. Over an item, left-drag
 moves it — the grab offset is held in VIRTUAL units, so the gesture survives a
 pan or zoom mid-drag — and right-click opens a one-button `cce-cloud --json`
 popup at `ccectl pointer-location`, whose reply comes back as
-`Message::RemoveItem(path)`. It carries the path rather than an index because
-that menu blocks on its own thread, and the list can be reordered by a drag or
-grown by a drop while it is open.
+`Message::MenuAction { node, action }`. It carries the canvas node id rather
+than an index because that menu blocks on its own thread, and the list can be
+reordered by a drag or grown by a drop while it is open.
 
 **Resize handles.** The compositor's `adjust` status topic (`on`/`off` as
 window-adjust mode — overview, or Super held — comes and goes) is the one
@@ -91,7 +145,7 @@ handles, the hovered one lit; a leave arrives as the off-screen move cce-ui
 synthesizes and clears it;
 a press on a disc starts a `Resize`, which scales the image
 PROPORTIONALLY (the mean of the two edge ratios the drag asks for),
-anchored on the opposite corner, and saves the sidecar on release. A press
+anchored on the opposite corner, and saves the board on release. A press
 on the body still moves. The discs are sized in virtual units, so they
 scale with the canvas rather than holding a screen size the way the
 compositor's do — this client never learns the camera zoom.
@@ -105,13 +159,13 @@ REPORTS them: `grid-items <id>:<x>:<y>:<w>:<h> ...` on the control socket
 change — load, a drop, a remove, a drag or resize of its own (a drag
 release re-reports even unmoved, since the press raised the item and the
 compositor's hit test wants the order). `DesktopItem::id` is a
-per-process counter (`assign_id`, `#[serde(skip)]`): the sidecar's
-identity is the path. Reports go through one thread (`spawn_reporter`) so
+per-process counter (`assign_id`): the board's identity is the canvas
+node id. Reports go through one thread (`spawn_reporter`) so
 they land in order and a compositor that is not up yet is retried, only
 the latest pending. The other direction is the `selection` status topic
 (`spawn_topic_listener`, which `adjust` now shares): `move <id>:<x>:<y>
 ...` sets the positions as a group move steps (rect damage, like a drag of
-this client's own — `Message::SelectionMove`) and `drop` saves the sidecar
+this client's own — `Message::SelectionMove`) and `drop` saves the board
 and reports afresh (`Message::SelectionDrop`). The highlight is the
 compositor's, drawn over the image like a window's wash; this client draws
 nothing for it. A press on a selected item never reaches this client (the
@@ -133,11 +187,9 @@ grabbed item thousands of virtual units. The compositor's hit-test speaks
 true surface coordinates since cce-compositor@feab593; do not reintroduce
 output-scale terms here.
 
-This directory is its own git repository whose `origin` is the local
-*bare* repo `~/git/cce-grid.git`: **committing is not publishing —
-`git push origin master` is**, after which `gitsite.timer` republishes it.
-(This crate has no `published` remote; some siblings keep one for the old
-static mirror.) `cce-grid.service` autostarts it with the session
+This directory is its own git repository whose `origin` is GitHub; a
+post-commit hook pushes each commit (git.lucas.co mirrors it hourly).
+`cce-grid.service` autostarts it with the session
 (WantedBy=cce-session.target); ccebuild installs both.
 
 Corner radii follow the DE-wide convention: the caller widens the nominal

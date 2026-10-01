@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "90aea0d03507846e7c49873400f0aa8d244bb5b2" }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "90aea0d03507846e7c49873400f0aa8d244bb5b2", features = ["markdown"] }
 calloop = "0.13.0"
 wayland-client = { version = "0.31", features = ["system"] }
 log = "0.4"
@@ -14,3 +14,7 @@ env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+cce-vault = { git = "https://github.com/lsgalante/cce-vault.git", rev = "252827c1f6033514fbed46d1c7c1632241344fce" }
+
+[dev-dependencies]
+tempfile = "3"
