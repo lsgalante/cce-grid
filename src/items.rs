@@ -345,6 +345,34 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Where a dropped image is kept. With the board in a vault: inside it, in
+/// the folder Obsidian puts new attachments for `board_file` in
+/// (`cce_vault::attachments`), so the picture syncs with the board and
+/// Obsidian shows the node instead of a missing file. Without a vault: the
+/// desktop folder, as before.
+pub fn save_image(bytes: &[u8], name: &str, vault: Option<&Path>, board_file: &str) -> std::io::Result<PathBuf> {
+    let Some(vault) = vault else { return save_to_desktop(bytes, name) };
+    let dir = vault.join(cce_vault::attachments::folder(vault, board_file));
+    std::fs::create_dir_all(&dir)?;
+    let path = cce_vault::attachments::unique_path(&dir, name);
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// Copy an image pinned from outside the vault into it (see [`save_image`]),
+/// leaving the original where it was. The new path, or `None` when it is
+/// already inside, or cannot be read.
+pub fn adopt_into_vault(path: &Path, vault: &Path, board_file: &str) -> Option<PathBuf> {
+    if path.starts_with(vault) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    save_image(&bytes, &name, Some(vault), board_file)
+        .map_err(|e| log::warn!("[board] copying {} into the vault: {e}", path.display()))
+        .ok()
+}
+
 /// Save bytes into the desktop folder under a non-colliding name.
 pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
     let dir = desktop_dir();
@@ -463,6 +491,33 @@ pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_images_land_in_the_vault_attachment_folder() {
+        let vault = tempfile::tempdir().unwrap();
+        let v = vault.path();
+        let p = save_image(b"png", "pic.png", Some(v), "Desktop.canvas").unwrap();
+        assert_eq!(p, v.join("pic.png"));
+        // A clash is numbered the way Obsidian numbers it.
+        assert_eq!(save_image(b"png", "pic.png", Some(v), "Desktop.canvas").unwrap(), v.join("pic 1.png"));
+        // Obsidian's attachment folder setting is followed.
+        std::fs::create_dir_all(v.join(".obsidian")).unwrap();
+        std::fs::write(v.join(".obsidian/app.json"), r#"{"attachmentFolderPath":"Attachments"}"#).unwrap();
+        assert_eq!(save_image(b"png", "pic.png", Some(v), "Desktop.canvas").unwrap(), v.join("Attachments/pic.png"));
+    }
+
+    #[test]
+    fn outside_images_are_copied_in_and_inside_ones_left() {
+        let (vault, outside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let src = outside.path().join("shot.jpg");
+        std::fs::write(&src, b"jpg").unwrap();
+        let new = adopt_into_vault(&src, vault.path(), "Desktop.canvas").unwrap();
+        assert_eq!(new, vault.path().join("shot.jpg"));
+        assert_eq!(std::fs::read(&new).unwrap(), b"jpg");
+        assert!(src.exists(), "the original stays");
+        assert_eq!(adopt_into_vault(&new, vault.path(), "Desktop.canvas"), None);
+        assert_eq!(adopt_into_vault(&outside.path().join("gone.jpg"), vault.path(), "Desktop.canvas"), None);
+    }
 
     #[test]
     fn uri_list_takes_the_first_real_line() {

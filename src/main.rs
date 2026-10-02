@@ -983,6 +983,38 @@ impl GridApp {
         None
     }
 
+    /// The board file's vault path (`Desktop.canvas`), what an attachment
+    /// for it is placed relative to.
+    fn board_file(&self) -> String {
+        let vault = self.board.vault.as_deref();
+        vault
+            .and_then(|v| self.board.path.strip_prefix(v).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Desktop.canvas".to_string())
+    }
+
+    /// Images pinned before the board kept them in the vault point outside
+    /// it (the desktop folder), so they reach no other device and Obsidian
+    /// shows them missing. Copy each in — the original stays put — and
+    /// repoint its node. Runs at startup; a no-op once all are inside.
+    fn adopt_outside_images(&mut self) {
+        let Some(vault) = self.board.vault.clone() else { return };
+        let board_file = self.board_file();
+        let mut moved = 0;
+        for (item, _) in &mut self.items {
+            if let Kind::Image(p) = &item.kind {
+                if let Some(new) = items::adopt_into_vault(p, &vault, &board_file) {
+                    log::info!("[board] copied {} into the vault as {}", p.display(), new.display());
+                    item.kind = Kind::Image(new);
+                    moved += 1;
+                }
+            }
+        }
+        if moved > 0 {
+            self.save_items();
+        }
+    }
+
     fn save_items(&mut self) {
         let model: Vec<items::DesktopItem> = self.items.iter().map(|(i, _)| i.clone()).collect();
         self.board.save(&model, &self.edges);
@@ -1240,6 +1272,7 @@ impl Application for GridApp {
             app.assign_id(&mut item);
             app.items.push((item, None));
         }
+        app.adopt_outside_images();
         app.report_items();
         app
     }
@@ -1450,6 +1483,8 @@ impl Application for GridApp {
         let (cell_w, cell_h) = (st.cell_w.max(16.0), st.cell_h.max(16.0));
         let sender = self.sender.clone();
         let mime = mime.to_string();
+        let vault = self.board.vault.clone();
+        let board_file = self.board_file();
         std::thread::spawn(move || {
             let (bytes, name) = match items::fetch(payload) {
                 Ok(v) => v,
@@ -1471,12 +1506,12 @@ impl Application for GridApp {
                 ));
                 return;
             };
-            // Save even though it is already decoded: the user asked for the
-            // file on their desktop, not just a picture on the canvas.
-            let path = match items::save_to_desktop(&bytes, &name) {
+            // Save even though it is already decoded: the board points at a
+            // file, and in a vault that file is what syncs with it.
+            let path = match items::save_image(&bytes, &name, vault.as_deref(), &board_file) {
                 Ok(p) => p,
                 Err(e) => {
-                    items::report_failure(&format!("could not save it to the desktop: {e}"));
+                    items::report_failure(&format!("could not save the image: {e}"));
                     return;
                 }
             };
