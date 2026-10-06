@@ -71,7 +71,10 @@ no vault, `$XDG_DATA_HOME/cce/desktop.canvas`. Obsidian-on-cce milestone 5.
 - **Cards** (note, text, link, file) draw through cce-ui's `MarkdownView`
   (`widget::markdown`, the `markdown` feature): laid out in virtual units
   (`layout_cards`, cached per node/width/text), painted with
-  `paint_scaled(k = patch.scale)`. Two traps, both fixed here:
+  `paint_scaled(k = patch.scale)`. A link card lays out the URL alone,
+  `link_glyph_room` narrower, and `paint_card` leads it with the `link`
+  cce-icons glyph (it was a "🔗 " emoji in the text until 2026-10-05).
+  Two traps, both fixed here:
   - **The scale factor.** The runner renders this surface at scale 1 but
     the toolkit-wide factor follows the output (2 on the laptop), and text
     shapes at it: `display_list` pins it to the surface's own scale, or

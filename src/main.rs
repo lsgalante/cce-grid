@@ -741,7 +741,8 @@ impl GridApp {
         let s = p.scale;
         let mut jobs: Vec<(String, String, f64)> = Vec::new();
         for (item, _) in &self.items {
-            let width = (item.w - 2.0 * CARD_PAD).max(20.0);
+            let lead = if matches!(item.kind, Kind::Link(_)) { link_glyph_room() as f64 } else { 0.0 };
+            let width = (item.w - 2.0 * CARD_PAD - lead).max(20.0);
             let source = match &item.kind {
                 Kind::Note(path) => {
                     if self.cards.get(&item.node).is_some_and(|c| (c.width - width).abs() < 0.5) {
@@ -750,7 +751,8 @@ impl GridApp {
                     std::fs::read_to_string(path).unwrap_or_else(|_| format!("*{} is missing*", item.name()))
                 }
                 Kind::Text(t) => t.clone(),
-                Kind::Link(u) => format!("🔗 {u}"),
+                // The URL alone; `paint_card` leads it with the `link` glyph.
+                Kind::Link(u) => u.clone(),
                 Kind::File(_) => format!("**{}**", item.name()),
                 _ => continue,
             };
@@ -796,8 +798,41 @@ impl GridApp {
         if let Some(c) = self.cards.get(&item.node) {
             let pad = (CARD_PAD * s) as f32;
             let inner = Rect { x: r.x + pad * 0.5, y: r.y + pad * 0.5, width: r.width - pad, height: r.height - pad };
+            // A link card's URL is led by the `link` glyph, in the colour
+            // the URL is drawn in, centred on its first line — the way
+            // cce-ui's markdown leads an embed it cannot show inline. The
+            // URL was laid out `link_glyph_room` narrower to make the room.
+            let glyph = matches!(item.kind, Kind::Link(_)).then(|| {
+                let (size, side) = (CARD_TEXT, link_glyph_side());
+                let (y, color) = c
+                    .layout
+                    .draws
+                    .iter()
+                    .find_map(|d| match d {
+                        markdown::Draw::Text { y, color, .. } => Some((*y, *color)),
+                        _ => None,
+                    })
+                    .unwrap_or((0.0, cce_ui::colors::TEXT_FG));
+                // A text draw's colour is linear (it is painted through
+                // `srgb_u8`); a glyph is tinted in sRGB, as a text colour.
+                let color = cce_ui::colors::to_srgb(color);
+                let sf = s as f32;
+                let rect = Rect {
+                    x: r.x + pad,
+                    y: r.y + pad + (y + 0.5 * (size * 1.3 - side)) * sf,
+                    width: side * sf,
+                    height: side * sf,
+                };
+                (rect, color)
+            });
+            let lead = if glyph.is_some() { link_glyph_room() * s as f32 } else { 0.0 };
             for frag in uncovered(inner, above) {
-                pc.clip(frag, |pc| c.layout.paint_scaled(pc, (r.x + pad, r.y + pad), s as f32, frag));
+                pc.clip(frag, |pc| {
+                    if let Some((rect, color)) = glyph {
+                        pc.icon("link", rect, color);
+                    }
+                    c.layout.paint_scaled(pc, (r.x + pad + lead, r.y + pad), s as f32, frag)
+                });
             }
         }
     }
@@ -910,6 +945,17 @@ fn anchor(i: &items::DesktopItem, side: Option<&str>, toward: (f64, f64)) -> ((f
         "bottom" => ((cx, i.y + i.h), (0.0, 1.0)),
         _ => ((i.x + i.w, cy), (1.0, 0.0)),
     }
+}
+
+/// The `link` glyph's side on a link card, in card units (the size cce-ui's
+/// markdown gives the glyph leading an embed).
+fn link_glyph_side() -> f32 {
+    (CARD_TEXT * 0.85).round()
+}
+
+/// What a link card's URL is moved right by: the glyph and a gap.
+fn link_glyph_room() -> f32 {
+    link_glyph_side() + (CARD_TEXT * 0.4).round()
 }
 
 fn srgb_u8(linear: [f32; 4]) -> [u8; 3] {
