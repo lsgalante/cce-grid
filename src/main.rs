@@ -13,9 +13,8 @@
 //! raised grout (per-cell half-gap-expanded `Recess` rings that abut at
 //! the rail centerlines), while every cell floor stays flat.
 
-use wayland_client::QueueHandle;
 
-use cce_ui::engine::{Application, EngineState, LogicalPosition, LogicalSize, WindowSettings};
+use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{Cap, DisplayList, PaintCtx};
 use cce_ui::widget::markdown::{self, Layout as CardLayout, ShapingMeasure, Theme};
@@ -1271,10 +1270,9 @@ impl GridApp {
 impl Application for GridApp {
     type Message = Message;
 
-    fn new(
-        _qh: &QueueHandle<EngineState<Self>>,
-        _sender: calloop::channel::Sender<Self::Message>,
-    ) -> Self {
+    fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
+        // The app keeps calloop's sender; `AppSender` converts into it.
+        let _sender: calloop::channel::Sender<Self::Message> = _sender.into();
         spawn_topic_listener("adjust", _sender.clone(), |line| {
             Some(Message::AdjustMode(line == "on"))
         });
