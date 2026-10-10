@@ -63,11 +63,20 @@ no vault, `$XDG_DATA_HOME/cce/desktop.canvas`. Obsidian-on-cce milestone 5.
   missing files while cce draws them (user decision, 2026-10-01).
 - **Migration:** the first run with no board converts the old
   `desktop-items.json` (images only) and renames it `.json.migrated`. An
-  unreadable board is never overwritten: the app runs with nothing.
+  unreadable board (a sync caught mid-write) is never overwritten: the app
+  runs with nothing and says so (a notification), saves nothing
+  (`Board::unreadable`), and reads it again when it changes — keeping
+  what was pinned meanwhile (`keep_local`). It used to be dropped for the
+  session, every pin since silently lost.
 - **Outside edits:** a `cce_vault::VaultWatcher` on the vault reloads the
   board when it changed and this client did not write it (`Board::seen`),
-  keeping textures by node id, and drops a note card's layout when its
-  note changes. The save's temp file is a dot-file so watchers skip it.
+  keeping textures by node id (`replace_items`), and drops a note card's
+  layout when its note changes. The save's temp file is a dot-file so
+  watchers skip it. A save that finds the file changed since it was read —
+  an edit the watcher has not delivered yet — merges instead of writing
+  over it (`board::merge`, three-way by node and edge id: what this client
+  changed wins, what it left alone follows the file) and the app shows the
+  merge.
 - **Cards** (note, text, link, file) draw through cce-ui's `MarkdownView`
   (`widget::markdown`, the `markdown` feature): laid out in virtual units
   (`layout_cards`, cached per node/width/text), painted with
@@ -89,8 +98,9 @@ no vault, `$XDG_DATA_HOME/cce/desktop.canvas`. Obsidian-on-cce milestone 5.
 - **Input:** right-click menus by kind (Open in Notes / Open link, Convert
   to note for a text card, Connect to…, Disconnect, New note card, Remove);
   "Connect to…" is finished by the next press on another item;
-  double-click opens a note in cce-notes (its socket, or a launch) and a
-  link or file in its default app. Drops: a `.md` file becomes a note
+  double-click opens a note in cce-notes (its socket, or a launch — on a
+  thread of its own with a deadline, `open_in_notes`: a cce-notes that
+  never answered froze the desktop) and a link or file in its default app. Drops: a `.md` file becomes a note
   card, plain text a text card, a web URL that is not an image a link
   card. Card corners resize freely; images keep their aspect. Groups take
   no input and are not reported to the compositor.
@@ -112,26 +122,38 @@ thumbnail wrapped in a link (Google Images' exact markup) puts the result page
 in uri-list, and fetching that yields HTML rather than a picture. For an
 unwrapped image the two agree, so the preference never does worse.
 
-A dropped image is saved into the desktop folder (`$XDG_DESKTOP_DIR` when
-user-dirs exports one, else `~/Desktop`) AND recorded on the board with the
-VIRTUAL-canvas position it landed at — so it comes back in the same world
-spot next session. Fetching
+A dropped image is saved — into the vault's attachment folder for the
+board when there is a vault (so it syncs with it), else the desktop folder
+(`$XDG_DESKTOP_DIR` when user-dirs exports one, else `~/Desktop`) — AND
+recorded on the board with the VIRTUAL-canvas position it landed at — so it
+comes back in the same world spot next session. Its name comes from the
+URL, so it is cut to one plain file name first (`safe_file_name`, also
+applied in both save functions): decoded, `..%2F…` or `%2Fhome%2F…` named a
+path out of the folder, and a crafted image could land anywhere in the home
+folder. Fetching
 shells out to `curl` rather than linking an HTTP stack: this process is a
 background renderer that otherwise needs no network at all, and for a
 once-in-a-while user action an async runtime plus a TLS stack would be the
 largest thing in the binary.
 
-Items draw as GPU-textured quads. Decode happens on a worker thread and the
-pixels return through `Message::ItemReady`, because the upload
-(`cce_ui::vk::upload_rgba`) has to happen on the main loop — which is also why
-`renderer_init` re-uploads every image restored from the board.
+Items draw as GPU-textured quads. Decoding is never on the main loop: a
+drop decodes on its worker thread (`Message::ItemReady`), and images
+restored from the board — at start, after `renderer_init` forgets the dead
+renderer's textures, after a reload — decode on worker threads too
+(`upload_missing` → `Message::ImageDecoded`), because the upload
+(`cce_ui::vk::upload_rgba`) has to happen on the main loop. Textures are
+shrunk to `items::MAX_TEX` (2048) and at most a few decode at once: an item
+shows a grid cell big, and at full size a board of photos stalled the
+desktop at login and held ~48 MB of texture each. Items are sized by the
+image's own pixels (`Decoded::natural`), not the texture's.
 
 They are the only reason this client takes input at all. `input_regions()`
 returns exactly the item rects (and an empty list when there is no patch), so
 the pointer passes straight through everywhere else. Over an item, left-drag
 moves it — the grab offset is held in VIRTUAL units, so the gesture survives a
-pan or zoom mid-drag — and right-click opens a one-button `cce-cloud --json`
-popup at `ccectl pointer-location`, whose reply comes back as
+pan or zoom mid-drag — and right-click opens a `cce-cloud --json` menu
+(by kind: Open, Connect to…, Remove…) at `ccectl pointer-location`, whose
+reply comes back as
 `Message::MenuAction { node, action }`. It carries the canvas node id rather
 than an index because that menu blocks on its own thread, and the list can be
 reordered by a drag or grown by a drop while it is open.

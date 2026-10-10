@@ -50,6 +50,19 @@ pub struct Board {
     /// The board file's mtime after this client's last write or read, so
     /// a change it did not make itself can be told apart.
     pub seen: Option<std::time::SystemTime>,
+    /// The file is there but did not parse (a sync caught mid-write, a bad
+    /// hand edit): never written over, and read again when it changes —
+    /// until then saves do nothing. It used to be dropped for the session:
+    /// an empty desktop until the next login, and every pin since lost.
+    pub unreadable: bool,
+}
+
+/// What a save found and did when the file had changed since it was read:
+/// the board as merged (this client's edits over the outside ones), for the
+/// caller to show.
+pub struct Merged {
+    pub items: Vec<DesktopItem>,
+    pub edges: Vec<Edge>,
 }
 
 /// Where the board lives: the vault's `Desktop.canvas`, else the data dir.
@@ -97,16 +110,17 @@ impl Board {
     }
 
     pub fn open_at(path: PathBuf, vault: Option<PathBuf>, legacy: &Path) -> (Board, Vec<DesktopItem>, Vec<Edge>) {
-        let mut board = Board { path, vault, canvas: Canvas::empty(), seen: None };
+        let mut board = Board { path, vault, canvas: Canvas::empty(), seen: None, unreadable: false };
         if board.path.exists() {
             match board.read() {
                 Ok((items, edges)) => return (board, items, edges),
                 Err(e) => {
                     // A board that does not parse must not be overwritten by
-                    // an empty one: run with nothing and leave the file be.
+                    // an empty one: run with nothing, leave the file be, and
+                    // try it again when it changes.
                     log::error!("[board] {} is unreadable ({e}); not loading or rewriting it", board.path.display());
-                    board.seen = None;
-                    board.path = PathBuf::new();
+                    board.unreadable = true;
+                    board.seen = mtime(&board.path);
                     return (board, Vec::new(), Vec::new());
                 }
             }
@@ -127,12 +141,18 @@ impl Board {
 
     /// Re-read the board file (it changed under us: Obsidian, a sync).
     pub fn read(&mut self) -> Result<(Vec<DesktopItem>, Vec<Edge>), String> {
-        let text = std::fs::read_to_string(&self.path).map_err(|e| e.to_string())?;
-        let canvas = canvas::from_str(&text).map_err(|e| e.to_string())?;
+        let (canvas, seen) = self.read_canvas()?;
         let (items, edges) = to_model(&canvas, self.vault.as_deref());
         self.canvas = canvas;
-        self.seen = mtime(&self.path);
+        self.seen = seen;
+        self.unreadable = false;
         Ok((items, edges))
+    }
+
+    fn read_canvas(&self) -> Result<(Canvas, Option<std::time::SystemTime>), String> {
+        let seen = mtime(&self.path);
+        let text = std::fs::read_to_string(&self.path).map_err(|e| e.to_string())?;
+        Ok((canvas::from_str(&text).map_err(|e| e.to_string())?, seen))
     }
 
     /// True when the file changed since this client last read or wrote it.
@@ -140,10 +160,37 @@ impl Board {
         !self.path.as_os_str().is_empty() && mtime(&self.path) != self.seen
     }
 
-    pub fn save(&mut self, items: &[DesktopItem], edges: &[Edge]) {
-        if self.path.as_os_str().is_empty() {
-            return; // the unreadable-board case above
+    /// Write `items` and `edges`. When the file changed since this client
+    /// last read or wrote it (an Obsidian edit or a sync the watcher has not
+    /// delivered yet), the outside edit is read and merged first rather
+    /// than written over — see [`merge`] — and the merge is returned for
+    /// the caller to show.
+    pub fn save(&mut self, items: &[DesktopItem], edges: &[Edge]) -> Option<Merged> {
+        if self.unreadable {
+            log::warn!("[board] {} is unreadable; not saving over it", self.path.display());
+            return None;
         }
+        let mut merged = None;
+        if self.changed_on_disk() {
+            match self.read_canvas() {
+                Ok((theirs, seen)) => {
+                    let vault = self.vault.as_deref();
+                    let (base_items, base_edges) = to_model(&self.canvas, vault);
+                    let (their_items, their_edges) = to_model(&theirs, vault);
+                    let m = merge(&base_items, &base_edges, items, edges, &their_items, &their_edges);
+                    log::info!("[board] {} changed outside; merged before saving", self.path.display());
+                    self.canvas = theirs;
+                    self.seen = seen;
+                    merged = Some(m);
+                }
+                // Gone or half-written: write ours, as before.
+                Err(e) => log::warn!("[board] {} changed but does not read ({e}); saving ours", self.path.display()),
+            }
+        }
+        let (items, edges) = match &merged {
+            Some(m) => (m.items.as_slice(), m.edges.as_slice()),
+            None => (items, edges),
+        };
         apply_model(&mut self.canvas, self.vault.as_deref(), items, edges);
         let text = canvas::to_string(&self.canvas);
         if let Some(dir) = self.path.parent() {
@@ -158,7 +205,84 @@ impl Board {
             Ok(()) => self.seen = mtime(&self.path),
             Err(e) => log::error!("[board] could not save {}: {e}", self.path.display()),
         }
+        merged
     }
+}
+
+/// Whether two nodes say the same thing, as a save would write them
+/// (positions are whole pixels there).
+fn same_node(a: &DesktopItem, b: &DesktopItem) -> bool {
+    let r = |v: f64| v.round();
+    a.kind == b.kind
+        && r(a.x) == r(b.x)
+        && r(a.y) == r(b.y)
+        && r(a.w).max(1.0) == r(b.w).max(1.0)
+        && r(a.h).max(1.0) == r(b.h).max(1.0)
+        && a.color == b.color
+}
+
+/// A three-way merge by id: `base` as last read, `ours` as this client has
+/// it now, `theirs` as the file is now. A node or edge this client changed,
+/// added or removed is taken from `ours`; one it left alone follows
+/// `theirs` (moved, changed, removed or added outside). Where both changed
+/// one node, ours wins. Order: ours, then what was added outside.
+pub fn merge(
+    base: &[DesktopItem],
+    base_edges: &[Edge],
+    ours: &[DesktopItem],
+    our_edges: &[Edge],
+    theirs: &[DesktopItem],
+    their_edges: &[Edge],
+) -> Merged {
+    let find = |list: &[DesktopItem], id: &str| list.iter().find(|i| i.node == id).cloned();
+    let mut items = Vec::new();
+    for o in ours {
+        match (find(base, &o.node), find(theirs, &o.node)) {
+            // Untouched here: theirs, or gone if they removed it.
+            (Some(b), t) if same_node(&b, o) => {
+                if let Some(mut t) = t {
+                    t.id = o.id;
+                    items.push(t);
+                }
+            }
+            // Changed or added here.
+            _ => items.push(o.clone()),
+        }
+    }
+    for t in theirs {
+        let added_outside = find(base, &t.node).is_none() && find(ours, &t.node).is_none();
+        if added_outside {
+            items.push(t.clone());
+        }
+    }
+    let find_edge = |list: &[Edge], id: &str| list.iter().find(|e| e.id == id).cloned();
+    let mut edges = Vec::new();
+    for o in our_edges {
+        match (find_edge(base_edges, &o.id), find_edge(their_edges, &o.id)) {
+            (Some(b), t) if b == *o => edges.extend(t),
+            _ => edges.push(o.clone()),
+        }
+    }
+    for t in their_edges {
+        if find_edge(base_edges, &t.id).is_none() && find_edge(our_edges, &t.id).is_none() {
+            edges.push(t.clone());
+        }
+    }
+    // An edge whose end is gone goes with it.
+    edges.retain(|e| items.iter().any(|i| i.node == e.from) && items.iter().any(|i| i.node == e.to));
+    Merged { items, edges }
+}
+
+/// After an unreadable board reads at last: the board as read, plus what was
+/// pinned meanwhile (`local`, nodes the file does not have).
+pub fn keep_local(fresh: Vec<DesktopItem>, local: Vec<DesktopItem>) -> Vec<DesktopItem> {
+    let mut out = fresh;
+    for l in local {
+        if !out.iter().any(|f| f.node == l.node) {
+            out.push(l);
+        }
+    }
+    out
 }
 
 fn migrate(legacy: &Path) -> Vec<DesktopItem> {
@@ -430,5 +554,83 @@ mod tests {
         assert!(items.is_empty());
         board.save(&[], &[]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    /// Write `text` as the board, making sure its mtime moves.
+    fn rewrite(path: &Path, text: &str) {
+        let before = mtime(path);
+        loop {
+            std::fs::write(path, text).unwrap();
+            if mtime(path) != before {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_board_unreadable_at_start_is_read_when_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Desktop.canvas");
+        // A sync caught mid-write.
+        std::fs::write(&path, &OBSIDIAN[..40]).unwrap();
+        let (mut board, items, _) = Board::open_at(path.clone(), None, &dir.path().join("none.json"));
+        assert!(items.is_empty() && board.unreadable);
+        assert_eq!(board.path, path, "the board must stay watched");
+        // Something pinned meanwhile is not written over the file...
+        let local = DesktopItem::new("p1".into(), Kind::Text("pinned meanwhile".into()), 0.0, 0.0, 10.0, 10.0);
+        board.save(std::slice::from_ref(&local), &[]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), &OBSIDIAN[..40]);
+        // ...and when the sync finishes, the board reads and keeps it.
+        rewrite(&path, OBSIDIAN);
+        assert!(board.changed_on_disk());
+        let (fresh, edges) = board.read().unwrap();
+        assert!(!board.unreadable);
+        let all = keep_local(fresh, vec![local]);
+        assert_eq!(all.len(), 6);
+        assert_eq!(all.last().unwrap().node, "p1");
+        board.save(&all, &edges);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("pinned meanwhile"));
+    }
+
+    #[test]
+    fn a_save_merges_an_outside_edit_it_had_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Desktop.canvas");
+        std::fs::write(&path, OBSIDIAN).unwrap();
+        let (mut board, mut items, edges) = Board::open_at(path.clone(), Some(vault()), &dir.path().join("none.json"));
+        // Elsewhere (a phone, then a sync): the text card moves, the image
+        // goes, a node is added.
+        let theirs = OBSIDIAN
+            .replace(r#""id":"t1","type":"text","text":"**hi**","x":450"#, r#""id":"t1","type":"text","text":"**hi**","x":999"#)
+            .replace("\t\t{\"id\":\"i1\",\"type\":\"file\",\"file\":\"/home/u/Desktop/cat.png\",\"x\":0,\"y\":400,\"width\":200,\"height\":100},\n", "")
+            .replace(r#"{"id":"f1""#, r#"{"id":"new","type":"text","text":"from the phone","x":5,"y":5,"width":50,"height":50},
+		{"id":"f1""#);
+        rewrite(&path, &theirs);
+        // Here, before the watcher said so: the note card is dragged.
+        items[1].x = 123.0;
+        let merged = board.save(&items, &edges).expect("the outside edit was merged");
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains(r#""id":"n1","type":"file","file":"notes/Idea.md","x":123"#), "ours: {out}");
+        assert!(out.contains(r#""id":"t1","type":"text","text":"**hi**","x":999"#), "theirs kept: {out}");
+        assert!(out.contains("from the phone"), "their new node kept: {out}");
+        assert!(!out.contains("cat.png"), "their removal kept: {out}");
+        let ids: Vec<&str> = merged.items.iter().map(|i| i.node.as_str()).collect();
+        assert_eq!(ids, ["g1", "n1", "t1", "f1", "new"]);
+        assert_eq!(merged.edges.len(), 1);
+        // Nothing new outside: a plain save, no merge.
+        assert!(board.save(&merged.items, &merged.edges).is_none());
+    }
+
+    #[test]
+    fn merge_rules() {
+        let n = |id: &str, x: f64| DesktopItem::new(id.into(), Kind::Text(id.into()), x, 0.0, 10.0, 10.0);
+        let base = vec![n("a", 0.0), n("b", 0.0), n("c", 0.0)];
+        // Ours: moved a, removed b. Theirs: moved a and c, added d.
+        let ours = vec![n("a", 5.0), n("c", 0.0)];
+        let theirs = vec![n("a", 9.0), n("b", 0.0), n("c", 7.0), n("d", 0.0)];
+        let m = merge(&base, &[], &ours, &[], &theirs, &[]);
+        let got: Vec<(String, f64)> = m.items.iter().map(|i| (i.node.clone(), i.x)).collect();
+        assert_eq!(got, [("a".into(), 5.0), ("c".into(), 7.0), ("d".into(), 0.0)], "ours wins a, our removal of b stands, their c and d kept");
     }
 }

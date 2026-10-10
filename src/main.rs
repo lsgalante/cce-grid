@@ -94,8 +94,13 @@ enum Message {
     /// it was reported and draws the selection; this side just follows.
     SelectionMove(Vec<(u64, f64, f64)>),
     /// The group move released (`drop`): the positions stand, so save the
-    /// sidecar and report the list afresh.
+    /// board and report the list afresh.
     SelectionDrop,
+    /// A pinned image (restored, or arrived by an outside edit) finished
+    /// decoding on a worker thread (`upload_missing`); `None` when it did
+    /// not decode. Matched back by node and kind: the list may have changed
+    /// meanwhile.
+    ImageDecoded { node: String, kind: Kind, decoded: Option<items::Decoded> },
 }
 
 /// Which corner handle of an item.
@@ -278,6 +283,8 @@ struct GridApp {
     _watcher: Option<cce_vault::VaultWatcher>,
     /// Laid-out note and text cards, by node id.
     cards: std::collections::HashMap<String, CardCache>,
+    /// Images being decoded for a texture, by node id (`upload_missing`).
+    decoding: std::collections::HashSet<String>,
     measure: Option<ShapingMeasure>,
     /// "Connect to…" was picked on this node: the next press on another
     /// item draws an edge to it.
@@ -1060,7 +1067,39 @@ impl GridApp {
 
     fn save_items(&mut self) {
         let model: Vec<items::DesktopItem> = self.items.iter().map(|(i, _)| i.clone()).collect();
-        self.board.save(&model, &self.edges);
+        // The file had changed outside (a sync the watcher had not delivered
+        // yet): the save merged it in, so show what was written.
+        if let Some(merged) = self.board.save(&model, &self.edges) {
+            self.replace_items(merged.items, merged.edges);
+        }
+    }
+
+    /// Show `fresh` and `edges` in place of the current board, keeping the
+    /// textures of images that are still there.
+    fn replace_items(&mut self, fresh: Vec<items::DesktopItem>, edges: Vec<Edge>) {
+        let mut old: Vec<(items::DesktopItem, Option<u32>)> = std::mem::take(&mut self.items);
+        for mut item in fresh {
+            let tex = old
+                .iter()
+                .position(|(o, _)| o.node == item.node && o.kind == item.kind)
+                .and_then(|i| old.swap_remove(i).1);
+            self.assign_id(&mut item);
+            self.items.push((item, tex));
+        }
+        for (_, id) in old {
+            if let Some(id) = id {
+                cce_ui::vk::free_image(id);
+            }
+        }
+        self.edges = edges;
+        self.cards.clear();
+        self.dragging = None;
+        self.resizing = None;
+        self.hover = None;
+        self.hover_item = None;
+        self.damage = Damage::Full;
+        self.upload_missing();
+        self.report_items();
     }
 
     /// Double-click: a note opens in cce-notes, a link or a file in its
@@ -1186,32 +1225,21 @@ impl GridApp {
             }
         }
         if paths.contains(&self.board.path) && self.board.changed_on_disk() {
+            let was_unreadable = self.board.unreadable;
             match self.board.read() {
                 Ok((fresh, edges)) => {
-                    // Keep uploaded textures for images that are still there.
-                    let mut old: Vec<(items::DesktopItem, Option<u32>)> = std::mem::take(&mut self.items);
-                    for mut item in fresh {
-                        let tex = old
-                            .iter()
-                            .position(|(o, _)| o.node == item.node && o.kind == item.kind)
-                            .and_then(|i| old.swap_remove(i).1);
-                        self.assign_id(&mut item);
-                        self.items.push((item, tex));
+                    if was_unreadable {
+                        // It reads at last: keep what was pinned meanwhile,
+                        // and write it into the board now.
+                        let local: Vec<items::DesktopItem> = self.items.iter().map(|(i, _)| i.clone()).collect();
+                        let fresh = board::keep_local(fresh, local);
+                        self.replace_items(fresh, edges);
+                        self.save_items();
+                        log::info!("[board] {} reads again; loaded it", self.board.path.display());
+                    } else {
+                        self.replace_items(fresh, edges);
+                        log::info!("[board] reloaded {} after an outside edit", self.board.path.display());
                     }
-                    for (_, id) in old {
-                        if let Some(id) = id {
-                            cce_ui::vk::free_image(id);
-                        }
-                    }
-                    self.edges = edges;
-                    self.cards.clear();
-                    self.dragging = None;
-                    self.resizing = None;
-                    self.hover = None;
-                    self.hover_item = None;
-                    self.upload_missing();
-                    self.report_items();
-                    log::info!("[board] reloaded {} after an outside edit", self.board.path.display());
                     changed = true;
                 }
                 Err(e) => log::warn!("[board] {} changed but does not read ({e}); keeping what is shown", self.board.path.display()),
@@ -1220,22 +1248,30 @@ impl GridApp {
         changed
     }
 
-    /// Decode and upload images that have no texture yet (restored, or
-    /// arrived by an outside edit).
+    /// Decode the images that have no texture yet (restored, or arrived by
+    /// an outside edit) — on worker threads, a few at a time and shrunk to
+    /// `items::MAX_TEX`; each comes back as `Message::ImageDecoded` and is
+    /// uploaded there. This ran on the loop that draws the desktop, at full
+    /// size: a board of phone photos stalled the desktop at login and kept
+    /// ~48 MB of texture per photo shown a grid cell big.
     fn upload_missing(&mut self) {
-        for (item, id) in self.items.iter_mut() {
-            if id.is_some() {
+        for (item, id) in &self.items {
+            if id.is_some() || self.decoding.contains(&item.node) {
                 continue;
             }
             let Kind::Image(path) = &item.kind else { continue };
-            let Ok(bytes) = std::fs::read(path) else {
-                log::warn!("[items] {} is gone; not drawing it", path.display());
-                continue;
-            };
-            match items::decode_rgba(&bytes) {
-                Some((pixels, w, h)) => *id = Some(cce_ui::vk::upload_rgba(pixels, w, h)),
-                None => log::warn!("[items] {} did not decode", path.display()),
-            }
+            self.decoding.insert(item.node.clone());
+            let (node, kind, path, sender) = (item.node.clone(), item.kind.clone(), path.clone(), self.sender.clone());
+            std::thread::spawn(move || {
+                let decoded = match std::fs::read(&path) {
+                    Ok(bytes) => items::decode_texture(&bytes),
+                    Err(e) => {
+                        log::warn!("[items] {} is gone ({e}); not drawing it", path.display());
+                        None
+                    }
+                };
+                let _ = sender.send(Message::ImageDecoded { node, kind, decoded });
+            });
         }
     }
 
@@ -1293,6 +1329,7 @@ impl Application for GridApp {
             board,
             _watcher: watcher,
             cards: std::collections::HashMap::new(),
+            decoding: std::collections::HashSet::new(),
             measure: None,
             connecting: None,
             last_press: None,
@@ -1313,6 +1350,15 @@ impl Application for GridApp {
         for mut item in loaded {
             app.assign_id(&mut item);
             app.items.push((item, None));
+        }
+        if app.board.unreadable {
+            let path = app.board.path.display().to_string();
+            std::thread::spawn(move || {
+                items::notify(
+                    "Desktop board unreadable",
+                    &format!("{path} does not parse. The desktop shows nothing and saves nothing until it reads again; it is reloaded when it changes."),
+                )
+            });
         }
         app.adopt_outside_images();
         app.report_items();
@@ -1395,6 +1441,16 @@ impl Application for GridApp {
                 // Persist only the model — the texture id is per-process.
                 self.save_items();
                 self.report_items();
+                *needs_rebuild = true;
+            }
+            Message::ImageDecoded { node, kind, decoded } => {
+                self.decoding.remove(&node);
+                let Some(d) = decoded else { return };
+                // Still pinned, still that image, still without a texture.
+                let Some((_, id)) = self.items.iter_mut().find(|(i, id)| i.node == node && i.kind == kind && id.is_none()) else {
+                    return;
+                };
+                *id = Some(cce_ui::vk::upload_rgba(d.pixels, d.tex.0, d.tex.1));
                 *needs_rebuild = true;
             }
             Message::AdjustMode(on) => {
@@ -1535,7 +1591,7 @@ impl Application for GridApp {
                     return;
                 }
             };
-            let Some((pixels, px_w, px_h)) = items::decode_rgba(&bytes) else {
+            let Some(decoded) = items::decode_texture(&bytes) else {
                 // A web page rather than a picture: pin it as a link card.
                 if let Some(url) = link {
                     let item = items::DesktopItem::new(board::new_id(), Kind::Link(url), vx - 150.0, vy - 40.0, 300.0, 80.0);
@@ -1557,12 +1613,15 @@ impl Application for GridApp {
                     return;
                 }
             };
-            let fit = (cell_w / px_w as f64).min(cell_h / px_h as f64).min(1.0);
-            let w = px_w as f64 * fit;
-            let h = px_h as f64 * fit;
+            // Sized by the image's own pixels; the texture may be smaller.
+            let (nat_w, nat_h) = (decoded.natural.0 as f64, decoded.natural.1 as f64);
+            let fit = (cell_w / nat_w).min(cell_h / nat_h).min(1.0);
+            let w = nat_w * fit;
+            let h = nat_h * fit;
             // Centred on the drop point.
             let item = items::DesktopItem::new(board::new_id(), Kind::Image(path), vx - w / 2.0, vy - h / 2.0, w, h);
-            let _ = sender.send(Message::ItemReady { item, pixels, px_w, px_h });
+            let (px_w, px_h) = decoded.tex;
+            let _ = sender.send(Message::ItemReady { item, pixels: decoded.pixels, px_w, px_h });
         });
     }
 

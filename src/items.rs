@@ -3,9 +3,10 @@
 // A drop on the desktop background lands here (the compositor routes drags
 // over the background onto the grid client — see its `Scene::at`, which hit-tests
 // the grid layer through its input region since cce-compositor@b82a0ee).
-// Each item is saved to the desktop folder AND recorded in a sidecar with the
-// virtual-canvas position it was dropped at, so it reappears in the same world
-// spot next session. Nothing here touches the GPU: the caller uploads the
+// Each item is saved (into the vault's attachment folder with a vault, else
+// the desktop folder) AND recorded on the board with the virtual-canvas
+// position it was dropped at, so it reappears in the same world spot next
+// session. Nothing here touches the GPU: the caller uploads the
 // decoded pixels, because that must happen on the main loop.
 //
 // Fetching shells out to curl rather than linking an HTTP stack. This process
@@ -207,13 +208,22 @@ pub fn percent_decode_path(s: &str) -> PathBuf {
 fn file_name_for(uri: &str, fallback_ext: &str) -> String {
     let trimmed = uri.split(['?', '#']).next().unwrap_or(uri);
     let last = trimmed.rsplit('/').next().unwrap_or("");
-    let last = percent_decode(last);
-    let looks_named = !last.is_empty() && last.contains('.') && last.len() <= 128;
-    if looks_named {
-        last
-    } else {
-        format!("dropped-image.{fallback_ext}")
-    }
+    // Decoded, `%2F` is a slash again: `..%2F..%2Fx` named a path out of
+    // the save folder. Only the plain name it ends in is kept.
+    safe_file_name(&percent_decode(last))
+        .filter(|n| n.contains('.') && n.len() <= 128)
+        .unwrap_or_else(|| format!("dropped-image.{fallback_ext}"))
+}
+
+/// `name` as one plain file name: its last component (split at `/` and
+/// `\\`), or `None` when that is empty, `.` or `..`. A name joined onto the
+/// save folder must not leave it — a dropped web image chose its own name
+/// from its URL, and a crafted one (`..%2F`, `%2Fhome%2F…`) wrote a file of
+/// the page's choosing anywhere in the home folder.
+pub fn safe_file_name(name: &str) -> Option<String> {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("").replace('\0', "");
+    let last = last.trim();
+    (!last.is_empty() && last != "." && last != "..").then(|| last.to_string())
 }
 
 /// A path in `dir` that does not exist yet, suffixing `-2`, `-3`, … A drop
@@ -354,9 +364,10 @@ fn decode_base64(s: &str) -> Option<Vec<u8>> {
 /// desktop folder, as before.
 pub fn save_image(bytes: &[u8], name: &str, vault: Option<&Path>, board_file: &str) -> std::io::Result<PathBuf> {
     let Some(vault) = vault else { return save_to_desktop(bytes, name) };
+    let name = safe_file_name(name).unwrap_or_else(|| "dropped-image".to_string());
     let dir = vault.join(cce_vault::attachments::folder(vault, board_file));
     std::fs::create_dir_all(&dir)?;
-    let path = cce_vault::attachments::unique_path(&dir, name);
+    let path = cce_vault::attachments::unique_path(&dir, &name);
     std::fs::write(&path, bytes)?;
     Ok(path)
 }
@@ -377,9 +388,10 @@ pub fn adopt_into_vault(path: &Path, vault: &Path, board_file: &str) -> Option<P
 
 /// Save bytes into the desktop folder under a non-colliding name.
 pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
+    let name = safe_file_name(name).unwrap_or_else(|| "dropped-image".to_string());
     let dir = desktop_dir();
     std::fs::create_dir_all(&dir)?;
-    let path = unique_path(&dir, name);
+    let path = unique_path(&dir, &name);
     std::fs::write(&path, bytes)?;
     Ok(path)
 }
@@ -468,11 +480,24 @@ pub fn open_externally(target: &str) {
     let _ = spawn_detached(open);
 }
 
+/// How long cce-notes may take to answer an `open`.
+const NOTES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Show a note in cce-notes: hand it to the running instance over its
-/// socket, or start one.
+/// socket, or start one. On a thread of its own: callers are on the loop
+/// that draws the desktop, and a cce-notes that took the connection but
+/// did not answer froze it (the reply was awaited with no deadline).
 pub fn open_in_notes(path: &Path) {
+    let socket = cce_ui::ipc::socket_path("cce-notes");
+    let path = path.to_path_buf();
+    std::thread::spawn(move || open_in_notes_at(&socket, &path));
+}
+
+fn open_in_notes_at(socket: &str, path: &Path) {
     use std::io::{BufRead, BufReader, Write};
-    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(cce_ui::ipc::socket_path("cce-notes")) {
+    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(socket) {
+        let _ = s.set_read_timeout(Some(NOTES_TIMEOUT));
+        let _ = s.set_write_timeout(Some(NOTES_TIMEOUT));
         if s.write_all(format!("open {}\n", path.display()).as_bytes()).is_ok() {
             let mut reply = String::new();
             let _ = BufReader::new(s).read_line(&mut reply);
@@ -482,6 +507,15 @@ pub fn open_in_notes(path: &Path) {
     let mut notes = std::process::Command::new(de_bin("cce-notes"));
     notes.arg("open").arg(path);
     let _ = spawn_detached(notes);
+}
+
+/// Tell the user something about the desktop board, as a notification.
+pub fn notify(title: &str, body: &str) {
+    let _ = std::process::Command::new(de_bin("ccectl"))
+        .args(["notify", title, body])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Tell the user a drop failed, and why. A drop that silently does nothing
@@ -496,12 +530,77 @@ pub fn report_failure(reason: &str) {
         .status();
 }
 
-/// Decode to straight RGBA8 for `cce_ui::vk::upload_rgba`.
-pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+/// The largest texture side kept. An item is drawn about a grid cell big
+/// (512 px by default); a full-size phone photo is ~48 MB of texture each,
+/// and a side past the GPU's limit (often 16384) may not draw at all.
+pub const MAX_TEX: u32 = 2048;
+/// Image decodes running at once, at most: each decodes at full size first.
+const MAX_DECODES: usize = 3;
+
+/// A decoded image: straight RGBA8 at `tex` (for `cce_ui::vk::upload_rgba`),
+/// and the image's own size, which places and sizes the item.
+#[derive(Clone)]
+pub struct Decoded {
+    pub pixels: Vec<u8>,
+    pub tex: (u32, u32),
+    pub natural: (u32, u32),
+}
+
+impl std::fmt::Debug for Decoded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Decoded {{ tex: {:?}, natural: {:?} }}", self.tex, self.natural)
+    }
+}
+
+/// Decode for a texture, shrunk to fit `MAX_TEX`. Off the UI thread: it
+/// takes one of a few decode slots for its duration.
+pub fn decode_texture(bytes: &[u8]) -> Option<Decoded> {
+    let _slot = decode_slots().take();
     let img = image::load_from_memory(bytes).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
-    Some((rgba.into_raw(), w, h))
+    let natural = (img.width(), img.height());
+    let img = if natural.0.max(natural.1) > MAX_TEX {
+        img.resize(MAX_TEX, MAX_TEX, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    let rgba = img.into_rgba8();
+    let tex = (rgba.width(), rgba.height());
+    Some(Decoded { pixels: rgba.into_raw(), tex, natural })
+}
+
+/// A counting semaphore over decodes (`MAX_DECODES` slots).
+struct Slots {
+    free: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+struct SlotGuard<'a>(&'a Slots);
+
+impl Slots {
+    const fn new(n: usize) -> Slots {
+        Slots { free: std::sync::Mutex::new(n), freed: std::sync::Condvar::new() }
+    }
+
+    fn take(&self) -> SlotGuard<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        SlotGuard(self)
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+fn decode_slots() -> &'static Slots {
+    static SLOTS: Slots = Slots::new(MAX_DECODES);
+    &SLOTS
 }
 
 #[cfg(test)]
@@ -533,6 +632,55 @@ mod tests {
         assert!(src.exists(), "the original stays");
         assert_eq!(adopt_into_vault(&new, vault.path(), "Desktop.canvas"), None);
         assert_eq!(adopt_into_vault(&outside.path().join("gone.jpg"), vault.path(), "Desktop.canvas"), None);
+    }
+
+    #[test]
+    fn a_dropped_url_cannot_name_a_path_out_of_the_folder() {
+        // `%2F` decodes to a slash: these named paths up and out.
+        assert_eq!(file_name_for("https://evil.example/..%2F..%2F.config%2Fautostart%2Fx.desktop", "png"), "x.desktop");
+        assert_eq!(file_name_for("https://evil.example/%2Fhome%2Fu%2F.local%2Flib%2Fevil.pth", "png"), "evil.pth");
+        assert_eq!(file_name_for("https://evil.example/..%2F..", "png"), "dropped-image.png");
+        assert_eq!(file_name_for("https://x.com/a%5C..%5Cb.png", "png"), "b.png");
+        assert_eq!(safe_file_name("../../x.png").as_deref(), Some("x.png"));
+        assert_eq!(safe_file_name(".."), None);
+        assert_eq!(safe_file_name("/"), None);
+
+        // And whatever a caller passes, a save stays in its folder.
+        let vault = tempfile::tempdir().unwrap();
+        let p = save_image(b"png", "../../escape.png", Some(vault.path()), "Desktop.canvas").unwrap();
+        assert_eq!(p, vault.path().join("escape.png"));
+        let p = save_image(b"png", "/tmp/abs.png", Some(vault.path()), "Desktop.canvas").unwrap();
+        assert_eq!(p, vault.path().join("abs.png"));
+    }
+
+    #[test]
+    fn opening_a_note_never_waits_on_a_silent_cce_notes() {
+        // A listener that accepts and never answers.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("notes.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let started = std::time::Instant::now();
+        let s = sock.to_string_lossy().into_owned();
+        let t = std::thread::spawn(move || open_in_notes_at(&s, Path::new("/v/N.md")));
+        let (_conn, _) = listener.accept().unwrap();
+        t.join().unwrap();
+        let took = started.elapsed();
+        assert!(took >= NOTES_TIMEOUT && took < NOTES_TIMEOUT * 3, "gave up after {took:?}");
+    }
+
+    #[test]
+    fn big_images_decode_to_a_capped_texture() {
+        let mut png = Vec::new();
+        image::RgbaImage::new(5000, 100)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let d = decode_texture(&png).unwrap();
+        assert_eq!(d.natural, (5000, 100));
+        assert_eq!(d.tex.0, MAX_TEX);
+        assert_eq!(d.pixels.len(), (d.tex.0 * d.tex.1 * 4) as usize);
+        let mut small = Vec::new();
+        image::RgbaImage::new(30, 20).write_to(&mut std::io::Cursor::new(&mut small), image::ImageFormat::Png).unwrap();
+        assert_eq!(decode_texture(&small).unwrap().tex, (30, 20));
     }
 
     #[test]
