@@ -445,13 +445,25 @@ pub fn item_menu(title: &str, entries: &[(&str, &str)]) -> Option<String> {
     reply.get("button")?.as_str().map(|s| s.to_string())
 }
 
+/// Spawn `cmd` and reap it on a background thread, so the child never lingers
+/// as a zombie once it exits. The same helper cce-mail, cce-files, cce-terminal
+/// and cce-system-interface each keep; cce-ui's shared `process::spawn_detached`
+/// went away in cce-ui 4e94236.
+fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Hand a path or URL to its default app (`xdg-open`), detached.
 pub fn open_externally(target: &str) {
-    let _ = std::process::Command::new("xdg-open")
-        .arg(target)
+    let mut open = std::process::Command::new("xdg-open");
+    open.arg(target)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+        .stderr(std::process::Stdio::null());
+    let _ = spawn_detached(open);
 }
 
 /// Show a note in cce-notes: hand it to the running instance over its
@@ -465,7 +477,9 @@ pub fn open_in_notes(path: &Path) {
             return;
         }
     }
-    let _ = std::process::Command::new(de_bin("cce-notes")).arg("open").arg(path).spawn();
+    let mut notes = std::process::Command::new(de_bin("cce-notes"));
+    notes.arg("open").arg(path);
+    let _ = spawn_detached(notes);
 }
 
 /// Tell the user a drop failed, and why. A drop that silently does nothing
