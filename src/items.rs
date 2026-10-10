@@ -15,6 +15,8 @@
 // far below the notice threshold — an async runtime and a TLS stack would be
 // the largest thing in the binary, for that.
 
+use cce_ui::fmt::percent_decode;
+use cce_ui::process::{de_bin, spawn_detached};
 use std::path::{Path, PathBuf};
 
 /// What a desktop item is — one JSON Canvas node (see `board.rs`).
@@ -176,25 +178,6 @@ pub fn parse_payload(mime: &str, data: &[u8]) -> Option<Payload> {
         .map(|l| l.trim())
         .find(|l| !l.is_empty() && !l.starts_with('#'))?;
     Some(Payload::Uri(uri.to_string()))
-}
-
-/// Percent-decode enough of a `file://` URI to get a real path back.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(b);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A `file://` URI's path part, percent-decoded.
@@ -396,28 +379,6 @@ pub fn save_to_desktop(bytes: &[u8], name: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Resolve a cce binary that is installed beside this one.
-///
-/// This process runs as a systemd user service, whose PATH is
-/// `/usr/local/bin:/usr/bin` — `~/.local/bin`, where every cce binary is
-/// installed, is NOT on it. Spawning one by bare name therefore fails with
-/// ENOENT under systemd while working perfectly from a shell or when the
-/// compositor spawns it, which is exactly how the context menu shipped
-/// broken: it worked in every test and never once on the real desktop.
-fn de_bin(name: &str) -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let beside = dir.join(name);
-            if beside.exists() {
-                return beside;
-            }
-        }
-    }
-    // Fall back to PATH: a dev build run straight out of target/ has no cce
-    // binaries beside it, but does have them on PATH.
-    std::path::PathBuf::from(name)
-}
-
 /// Show a context menu titled `title` with `entries` (action id, label) and
 /// return the chosen action id, if any. Runs on a worker thread: it blocks
 /// until the menu closes.
@@ -459,18 +420,6 @@ pub fn item_menu(title: &str, entries: &[(&str, &str)]) -> Option<String> {
     reply.get("button")?.as_str().map(|s| s.to_string())
 }
 
-/// Spawn `cmd` and reap it on a background thread, so the child never lingers
-/// as a zombie once it exits. The same helper cce-mail, cce-files, cce-terminal
-/// and cce-system-interface each keep; cce-ui's shared `process::spawn_detached`
-/// went away in cce-ui 4e94236.
-fn spawn_detached(mut cmd: std::process::Command) -> std::io::Result<()> {
-    let mut child = cmd.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
 /// Hand a path or URL to its default app (`xdg-open`), detached.
 pub fn open_externally(target: &str) {
     let mut open = std::process::Command::new("xdg-open");
@@ -480,33 +429,12 @@ pub fn open_externally(target: &str) {
     let _ = spawn_detached(open);
 }
 
-/// How long cce-notes may take to answer an `open`.
-const NOTES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Show a note in cce-notes: hand it to the running instance over its
-/// socket, or start one. On a thread of its own: callers are on the loop
-/// that draws the desktop, and a cce-notes that took the connection but
-/// did not answer froze it (the reply was awaited with no deadline).
+/// Show a note in cce-notes: hand it to the running instance, or start one
+/// (`cce_vault::notes_ipc::open`, on its own thread: callers are on the loop
+/// that draws the desktop, and a cce-notes that took the connection but did
+/// not answer froze it).
 pub fn open_in_notes(path: &Path) {
-    let socket = cce_ui::ipc::socket_path("cce-notes");
-    let path = path.to_path_buf();
-    std::thread::spawn(move || open_in_notes_at(&socket, &path));
-}
-
-fn open_in_notes_at(socket: &str, path: &Path) {
-    use std::io::{BufRead, BufReader, Write};
-    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(socket) {
-        let _ = s.set_read_timeout(Some(NOTES_TIMEOUT));
-        let _ = s.set_write_timeout(Some(NOTES_TIMEOUT));
-        if s.write_all(format!("open {}\n", path.display()).as_bytes()).is_ok() {
-            let mut reply = String::new();
-            let _ = BufReader::new(s).read_line(&mut reply);
-            return;
-        }
-    }
-    let mut notes = std::process::Command::new(de_bin("cce-notes"));
-    notes.arg("open").arg(path);
-    let _ = spawn_detached(notes);
+    cce_vault::notes_ipc::open(path, None, |e| log::warn!("[items] {e}"));
 }
 
 /// Tell the user something about the desktop board, as a notification.
@@ -651,21 +579,6 @@ mod tests {
         assert_eq!(p, vault.path().join("escape.png"));
         let p = save_image(b"png", "/tmp/abs.png", Some(vault.path()), "Desktop.canvas").unwrap();
         assert_eq!(p, vault.path().join("abs.png"));
-    }
-
-    #[test]
-    fn opening_a_note_never_waits_on_a_silent_cce_notes() {
-        // A listener that accepts and never answers.
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("notes.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        let started = std::time::Instant::now();
-        let s = sock.to_string_lossy().into_owned();
-        let t = std::thread::spawn(move || open_in_notes_at(&s, Path::new("/v/N.md")));
-        let (_conn, _) = listener.accept().unwrap();
-        t.join().unwrap();
-        let took = started.elapsed();
-        assert!(took >= NOTES_TIMEOUT && took < NOTES_TIMEOUT * 3, "gave up after {took:?}");
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! the rail centerlines), while every cell floor stays flat.
 
 
+use cce_ui::ipc::ctl::{self, StatusTopic};
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
 use cce_ui::scene::paint::{Cap, DisplayList, PaintCtx};
@@ -156,7 +157,7 @@ const MIN_ITEM_SIZE: f64 = 16.0;
 /// handles should already be up. `selection` is one-shot: its lines come
 /// only while a group move is carrying this client's images.
 fn spawn_topic_listener(
-    topic: &'static str,
+    topic: StatusTopic,
     sender: calloop::channel::Sender<Message>,
     parse: fn(&str) -> Option<Message>,
 ) {
@@ -164,7 +165,7 @@ fn spawn_topic_listener(
     std::thread::spawn(move || {
         let mut retry_s = 1u64;
         loop {
-            let path = cce_ui::ipc::socket_path("cce-status-interface");
+            let path = ctl::status_socket();
             if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
                 if stream.write_all(format!("{topic}\n").as_bytes()).is_ok() {
                     let mut reader = std::io::BufReader::new(stream);
@@ -186,30 +187,14 @@ fn spawn_topic_listener(
     });
 }
 
-/// A `selection` topic line: `move <id>:<x>:<y> ...` or `drop`. Anything
-/// else — or a `move` with nothing parseable on it — is ignored.
+/// A `selection` topic line (`ctl::SelectionEvent`: `move <id>:<x>:<y> ...`
+/// or `drop`). Anything else — or a `move` with nothing parseable on it — is
+/// ignored.
 fn parse_selection_line(line: &str) -> Option<Message> {
-    let mut words = line.split_whitespace();
-    match words.next()? {
-        "drop" => Some(Message::SelectionDrop),
-        "move" => {
-            let moves: Vec<(u64, f64, f64)> = words
-                .filter_map(|tok| {
-                    let mut f = tok.split(':');
-                    let id = f.next()?.parse::<u64>().ok()?;
-                    let x = f.next()?.parse::<f64>().ok()?;
-                    let y = f.next()?.parse::<f64>().ok()?;
-                    Some((id, x, y))
-                })
-                .collect();
-            if moves.is_empty() {
-                None
-            } else {
-                Some(Message::SelectionMove(moves))
-            }
-        }
-        _ => None,
-    }
+    Some(match ctl::SelectionEvent::parse(line)? {
+        ctl::SelectionEvent::Drop => Message::SelectionDrop,
+        ctl::SelectionEvent::Move(moves) => Message::SelectionMove(moves),
+    })
 }
 
 /// The thread that tells the compositor what is pinned (`grid-items`, the
@@ -238,7 +223,9 @@ fn spawn_reporter() -> std::sync::mpsc::Sender<String> {
                 pending = Some(newer);
             }
             let line = pending.take().unwrap_or_default();
-            match cce_ui::ipc::send_command("cce", &line) {
+            // Bounded: a compositor wedged mid-frame must not hold the
+            // newest report behind a reply that never comes.
+            match ctl::send(&line, Some(std::time::Duration::from_secs(5))) {
                 Ok(_) => retry_s = 1,
                 Err(e) => {
                     log::debug!("[items] report not delivered ({e}); retrying in {retry_s}s");
@@ -1283,14 +1270,13 @@ impl GridApp {
     /// rect this client made itself; the compositor moves its own copy
     /// during a group move and hears the settled list on `drop`.
     fn report_items(&self) {
-        let mut line = String::from("grid-items");
-        for (item, _) in self.items.iter().filter(|(i, _)| i.interactive()) {
-            line.push_str(&format!(
-                " {}:{:.2}:{:.2}:{:.2}:{:.2}",
-                item.id, item.x, item.y, item.w, item.h
-            ));
-        }
-        let _ = self.reporter.send(line);
+        let items = self
+            .items
+            .iter()
+            .filter(|(i, _)| i.interactive())
+            .map(|(item, _)| ctl::DesktopItem { id: item.id, x: item.x, y: item.y, w: item.w, h: item.h })
+            .collect();
+        let _ = self.reporter.send(ctl::Request::GridItems(items).to_string());
     }
 }
 
@@ -1300,10 +1286,10 @@ impl Application for GridApp {
     fn create(_sender: cce_ui::engine::AppSender<Self::Message>) -> Self {
         // The app keeps calloop's sender; `AppSender` converts into it.
         let _sender: calloop::channel::Sender<Self::Message> = _sender.into();
-        spawn_topic_listener("adjust", _sender.clone(), |line| {
+        spawn_topic_listener(StatusTopic::Adjust, _sender.clone(), |line| {
             Some(Message::AdjustMode(line == "on"))
         });
-        spawn_topic_listener("selection", _sender.clone(), parse_selection_line);
+        spawn_topic_listener(StatusTopic::Selection, _sender.clone(), parse_selection_line);
         let (board, loaded, edges) = board::Board::open();
         // The board's folder is watched when it is a vault: the board file
         // itself (an Obsidian edit, a sync) and the notes cards show.
