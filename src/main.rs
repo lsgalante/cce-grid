@@ -164,14 +164,7 @@ fn spawn_topic_listener(
     std::thread::spawn(move || {
         let mut retry_s = 1u64;
         loop {
-            let path = {
-                let primary = cce_ui::ipc::socket_path("cce-status-interface");
-                if std::path::Path::new(&primary).exists() {
-                    primary
-                } else {
-                    cce_ui::ipc::socket_path("cce-status")
-                }
-            };
+            let path = cce_ui::ipc::socket_path("cce-status-interface");
             if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&path) {
                 if stream.write_all(format!("{topic}\n").as_bytes()).is_ok() {
                     let mut reader = std::io::BufReader::new(stream);
