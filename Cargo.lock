@@ -425,7 +425,7 @@ dependencies = [
 [[package]]
 name = "cce-core"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=27a2567b217312898a5de44ce430533d9870b4e4#27a2567b217312898a5de44ce430533d9870b4e4"
+source = "git+https://github.com/lsgalante/cce-core.git?rev=6a542c18ee31a20cfa3ecaa9da71ffa1d995af04#6a542c18ee31a20cfa3ecaa9da71ffa1d995af04"
 dependencies = [
  "fluent-bundle",
  "kdl",
@@ -437,22 +437,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "cce-core"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-core.git?rev=6a542c18ee31a20cfa3ecaa9da71ffa1d995af04#6a542c18ee31a20cfa3ecaa9da71ffa1d995af04"
-dependencies = [
- "libc",
- "log",
- "web-time",
-]
-
-[[package]]
 name = "cce-grid"
 version = "0.1.0"
 dependencies = [
  "calloop",
  "cce-ui",
- "cce-vault 0.1.0 (git+https://github.com/lsgalante/cce-vault.git?rev=3a7348a77ea6381d63b7358d14baf155637a7e38)",
+ "cce-vault",
  "env_logger",
  "image",
  "log",
@@ -465,7 +455,7 @@ dependencies = [
 [[package]]
 name = "cce-ui"
 version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-ui.git?rev=3c5b1fde4e8c4115b6f2666f8e661da9bc9a2850#3c5b1fde4e8c4115b6f2666f8e661da9bc9a2850"
+source = "git+https://github.com/lsgalante/cce-ui.git?rev=174185f9df9996e505a2e1b351544403d64bf2fa#174185f9df9996e505a2e1b351544403d64bf2fa"
 dependencies = [
  "accesskit",
  "ash",
@@ -473,8 +463,8 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=27a2567b217312898a5de44ce430533d9870b4e4)",
- "cce-vault 0.1.0 (git+https://github.com/lsgalante/cce-vault.git?rev=672948dcacca3b4f17bc74c0a81dc741c4bac9a7)",
+ "cce-core",
+ "cce-vault",
  "chrono",
  "cosmic-text",
  "cursor-icon",
@@ -514,25 +504,7 @@ name = "cce-vault"
 version = "0.1.0"
 source = "git+https://github.com/lsgalante/cce-vault.git?rev=3a7348a77ea6381d63b7358d14baf155637a7e38#3a7348a77ea6381d63b7358d14baf155637a7e38"
 dependencies = [
- "cce-core 0.1.0 (git+https://github.com/lsgalante/cce-core.git?rev=6a542c18ee31a20cfa3ecaa9da71ffa1d995af04)",
- "chrono",
- "indexmap",
- "kdl",
- "log",
- "notify",
- "percent-encoding",
- "pulldown-cmark",
- "serde",
- "serde_json",
- "walkdir",
- "yaml-rust2",
-]
-
-[[package]]
-name = "cce-vault"
-version = "0.1.0"
-source = "git+https://github.com/lsgalante/cce-vault.git?rev=672948dcacca3b4f17bc74c0a81dc741c4bac9a7#672948dcacca3b4f17bc74c0a81dc741c4bac9a7"
-dependencies = [
+ "cce-core",
  "chrono",
  "indexmap",
  "kdl",
