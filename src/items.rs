@@ -159,8 +159,10 @@ pub fn parse_payload(mime: &str, data: &[u8]) -> Option<Payload> {
     let text = if mime == "text/x-moz-url" {
         // Firefox's own flavour is UTF-16LE, "url\ntitle".
         let units: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[lo, hi]| u16::from_le_bytes([lo, hi]))
             .collect();
         String::from_utf16_lossy(&units)
     } else {

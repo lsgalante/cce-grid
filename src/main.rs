@@ -108,8 +108,6 @@ enum Corner {
 }
 
 impl Corner {
-    const ALL: [Corner; 4] = [Corner::TopLeft, Corner::TopRight, Corner::BottomLeft, Corner::BottomRight];
-
     /// Which way the corner faces: +1 on the right/bottom edge, -1 on the
     /// left/top. Dragging the corner by (dx, dy) grows the item by
     /// (sx*dx, sy*dy).
@@ -554,7 +552,7 @@ impl GridApp {
 
         // The rail surface: the whole patch in gap color.
         pc.quad(
-            Rect { x: 0.0, y: 0.0, width: size.width as f32, height: size.height as f32 },
+            Rect { x: 0.0, y: 0.0, width: size.width, height: size.height },
             st.gap_color,
         );
 
@@ -639,7 +637,7 @@ impl GridApp {
                 ((inset_y + len_h * 0.5 - p.y) * s) as f32,
             );
             pc.lattice(
-                Rect { x: 0.0, y: 0.0, width: size.width as f32, height: size.height as f32 },
+                Rect { x: 0.0, y: 0.0, width: size.width, height: size.height },
                 ((period_x * s) as f32, (period_y * s) as f32),
                 origin,
                 ((len_w * s) as f32, (len_h * s) as f32),
@@ -663,7 +661,7 @@ impl GridApp {
         // for nothing. A margin keeps a card's label (drawn above it).
         let on_patch = |r: &Rect| {
             let m = (CARD_LABEL * 2.0 * s) as f32;
-            !(r.x + r.width < -m || r.y + r.height < -m || r.x > size.width as f32 + m || r.y > size.height as f32 + m)
+            !(r.x + r.width < -m || r.y + r.height < -m || r.x > size.width + m || r.y > size.height + m)
         };
         // Groups are frames behind everything else.
         for (item, _) in &self.items {
@@ -1187,7 +1185,7 @@ impl GridApp {
                 }
             }
         }
-        if paths.iter().any(|c| *c == self.board.path) && self.board.changed_on_disk() {
+        if paths.contains(&self.board.path) && self.board.changed_on_disk() {
             match self.board.read() {
                 Ok((fresh, edges)) => {
                     // Keep uploaded textures for images that are still there.
@@ -1714,7 +1712,7 @@ impl Application for GridApp {
         pos: LogicalPosition,
         needs_rebuild: &mut bool,
     ) -> Option<Self::Message> {
-        let Some(p) = self.patch else { return None };
+        let p = self.patch?;
         if p.scale <= 0.0 {
             return None;
         }
